@@ -98,7 +98,7 @@ class MoNuSegInference:
         self.outdir = Path(outdir)
         self.outdir.mkdir(exist_ok=True, parents=True)
         self.magnification = magnification
-        self.overlap = 0
+        self.overlap = overlap
         self.patching = patching
         if overlap > 0:
             assert patching, "Patching must be activated"
@@ -113,13 +113,6 @@ class MoNuSegInference:
             patching=patching,
             overlap=overlap,
         )
-        # self.inference_dataloader = DataLoader(
-        #     self.inference_dataset,
-        #     batch_size=1,
-        #     num_workers=8,
-        #     pin_memory=False,
-        #     shuffle=False,
-        # )
         raw_transform = sam_training.identity
 
         sampler = MinInstanceSampler(min_num_instances=3)
@@ -271,13 +264,13 @@ class MoNuSegInference:
         rec_ds = []  # recall per image
 
         inference_loop = tqdm.tqdm(
-            enumerate(self.inference_dataloader), total=len(self.inference_dataloader) ### why do they even enumerate when not using the index in their version?
+            enumerate(self.inference_dataloader), total=len(self.inference_dataloader)
         )
 
         with torch.no_grad():
             for image_idx, batch in inference_loop:
                 image_metrics = self.inference_step(
-                    model=self.model, batch=batch, generate_plots=generate_plots, image_index=f'{image_idx:04}' ### added image_idx and pass it to inference step for file naming
+                    model=self.model, batch=batch, generate_plots=generate_plots, image_index=f'{image_idx:04}'
                 )
                 image_names.append(image_metrics["image_name"])
                 binary_dice_scores.append(image_metrics["binary_dice_score"])
@@ -313,7 +306,7 @@ class MoNuSegInference:
         [self.logger.info(f"{f'{k}:': <25} {v}") for k, v in dataset_metrics.items()]
 
     def inference_step(
-        self, model: nn.Module, batch: object, image_index, generate_plots: bool = False  ### added image_index as an argument for file name creation
+        self, model: nn.Module, batch: object, image_index, generate_plots: bool = False
     ) -> dict:
         """Inference step
 
@@ -327,25 +320,20 @@ class MoNuSegInference:
 
         """
         img = batch[0].to(self.device)
-        print(img.shape)
         if len(img.shape) > 4:
             img = img[0]
             img = rearrange(img, "c i j w h -> (i j) c w h")
         img = img.to(torch.float32)
         if torch.max(img) >= 5:
-            print('Normalizing image')
             img = img / 255
         instance_map = batch[1]
-        image_name = f"{image_index}.tiff"  #list(batch[2]) ### CHANGE! since our batches only consist of (image, label), we do not give tissue_types or figure filenames
+        image_name = f"{image_index}.tiff"
         binary_map = (instance_map > 0).int()
         binary_map_ = torch.squeeze(binary_map)
-        binary_map__ = torch.unsqueeze(binary_map_, dim=0)
-        mask = {                                            # their loader apparently returns a mask dictionary containing several maps, this dictionary is created here for our loader
+        mask = {
             "instance_map": torch.unsqueeze(torch.squeeze(instance_map), dim=0),
-            "nuclei_binary_map": binary_map__
+            "nuclei_binary_map": torch.unsqueeze(binary_map_, dim=0)
         }
-        print('instance_map shape: ', mask['instance_map'].shape)
-
         mask["instance_types"] = calculate_instances(
             torch.unsqueeze(mask["nuclei_binary_map"], dim=0), mask["instance_map"]
         )
@@ -390,7 +378,7 @@ class MoNuSegInference:
                 img = torch.unsqueeze(img, dim=0)
                 img = torch.permute(img, (0, 3, 1, 2))
             elif self.overlap != 0 and self.patching:
-                h, w = mask['nuclei_binary_map'].shape[1:]   # changes mask["nuclei_binary_map"] to binary_map
+                h, w = mask['nuclei_binary_map'].shape[1:]
                 total_img = torch.zeros((3, h, w))
                 decomposed_patch_num = int(np.sqrt(img.shape[0]))
                 for i in range(decomposed_patch_num):
@@ -406,7 +394,7 @@ class MoNuSegInference:
                 img=img,
                 predictions=predictions,
                 ground_truth=mask,
-                img_name=image_name, # removed indexing that does not work for our image names
+                img_name=image_name,  # removed indexing, which does not work and is not necessary for our image names
                 outdir=self.outdir,
                 scores=scores,
             )
@@ -465,7 +453,7 @@ class MoNuSegInference:
             .detach()
             .cpu()
         )
-        remapped_instance_pred = remap_label(predictions["instance_map"])
+        remapped_instance_pred = remap_label(predictions["instance_map"]) ## TODO inference masks to extract
         remapped_gt = remap_label(instance_maps_gt)
         [dq, sq, pq], _ = get_fast_pq(true=remapped_gt, pred=remapped_instance_pred)
 

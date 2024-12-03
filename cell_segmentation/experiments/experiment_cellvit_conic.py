@@ -13,7 +13,8 @@ import shutil
 import sys
 
 import yaml
-
+from torch_em.data import MinInstanceSampler
+import micro_sam.training as sam_training
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
@@ -21,7 +22,6 @@ sys.path.insert(0, parentdir)
 import uuid
 from pathlib import Path
 from typing import Callable, Tuple, Union
-from dataloader_util import get_loader
 import albumentations as A
 import torch
 import torch.nn as nn
@@ -178,52 +178,40 @@ class ExperimentCellViTCoNic(BaseExperiment):
                 )
 
         ### Data handling
-        # train_transforms, val_transforms = self.get_transforms(
-        #     self.run_conf["transformations"],
-        #     input_shape=self.run_conf["data"].get("input_shape", 256),
-        # )
+        train_transforms, val_transforms = self.get_transforms(
+            self.run_conf["transformations"],
+            input_shape=self.run_conf["data"].get("input_shape", 256),
+        )
 
-        # train_dataset, val_dataset = self.get_datasets(
-        #     train_transforms=train_transforms,
-        #     val_transforms=val_transforms,
-        # )
+        train_dataset, val_dataset = self.get_datasets(
+            train_transforms=train_transforms,
+            val_transforms=val_transforms,
+        )
 
-        # # load sampler
-        # training_sampler = self.get_sampler(
-        #     train_dataset=train_dataset,
-        #     strategy=self.run_conf["training"].get("sampling_strategy", "random"),
-        #     gamma=self.run_conf["training"].get("sampling_gamma", 1),
-        # )
+        # load sampler
+        training_sampler = self.get_sampler(
+            train_dataset=train_dataset,
+            strategy=self.run_conf["training"].get("sampling_strategy", "random"),
+            gamma=self.run_conf["training"].get("sampling_gamma", 1),
+        )
 
-        # define dataloaders
-        # train_dataloader = DataLoader(  --> dataloaders commented out since we are using our own
-        #     train_dataset,
-        #     batch_size=self.run_conf["training"]["batch_size"],
-        #     sampler=training_sampler,
-        #     num_workers=16,
-        #     pin_memory=False,
-        #     worker_init_fn=self.seed_worker,
-        # )
+        define dataloaders
+        train_dataloader = DataLoader(  --> dataloaders commented out since we are using our own
+            train_dataset,
+            batch_size=self.run_conf["training"]["batch_size"],
+            sampler=training_sampler,
+            num_workers=16,
+            pin_memory=False,
+            worker_init_fn=self.seed_worker,
+        )
 
-        # val_dataloader = DataLoader(
-        #     val_dataset,
-        #     batch_size=128,
-        #     num_workers=16,
-        #     pin_memory=True,
-        #     worker_init_fn=self.seed_worker,
-        # )
-        raw_transform = sam_training.identity
-
-        sampler = MinInstanceSampler(min_num_instances=3)
-        self.inference_dataloader = get_loader(
-            path=dataset_path,
-            dataset_name='monuseg',
-            patch_shape=(1, 512, 512),
-            batch_size=1,
-            split='test',
-            raw_transform=raw_transform,
-            sampler=sampler
-            )
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=128,
+            num_workers=16,
+            pin_memory=True,
+            worker_init_fn=self.seed_worker,
+        )
 
         # start Training
         self.logger.info("Instantiate Trainer")
@@ -283,10 +271,10 @@ class ExperimentCellViTCoNic(BaseExperiment):
         Args:
             dataset_path (Union[Path, str]): Path to dataset folder
         """
-        dataset_config_path = Path(dataset_path) / "dataset_config.yaml"
-        with open(dataset_config_path, "r") as dataset_config_file:
-            yaml_config = yaml.safe_load(dataset_config_file)
-            self.dataset_config = dict(yaml_config)
+        # dataset_config_path = Path(dataset_path) / "dataset_config.yaml"
+        # with open(dataset_config_path, "r") as dataset_config_file:
+        #     yaml_config = yaml.safe_load(dataset_config_file)
+        #     self.dataset_config = dict(yaml_config)
 
     def get_loss_fn(self, loss_fn_settings: dict) -> dict:
         """Create a dictionary with loss functions for all branches
