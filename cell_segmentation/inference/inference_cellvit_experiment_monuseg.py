@@ -4,11 +4,13 @@
 # @ Fabian Hörst, fabian.hoerst@uk-essen.de
 # Institute for Artifical Intelligence in Medicine,
 # University Medicine Essen
-
+from torch_em.data import MinInstanceSampler
+import micro_sam.training as sam_training
 import argparse
 import inspect
 import os
 import sys
+from dataloader_util import get_loader
 
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
@@ -22,6 +24,7 @@ BaseExperiment.seed_run(1232)
 
 from pathlib import Path
 from typing import List, Union, Tuple
+
 
 import albumentations as A
 import cv2 as cv2
@@ -95,7 +98,7 @@ class MoNuSegInference:
         self.outdir = Path(outdir)
         self.outdir.mkdir(exist_ok=True, parents=True)
         self.magnification = magnification
-        self.overlap = overlap
+        self.overlap = 0
         self.patching = patching
         if overlap > 0:
             assert patching, "Patching must be activated"
@@ -110,13 +113,25 @@ class MoNuSegInference:
             patching=patching,
             overlap=overlap,
         )
-        self.inference_dataloader = DataLoader(
-            self.inference_dataset,
+        # self.inference_dataloader = DataLoader(
+        #     self.inference_dataset,
+        #     batch_size=1,
+        #     num_workers=8,
+        #     pin_memory=False,
+        #     shuffle=False,
+        # )
+        raw_transform = sam_training.identity
+
+        sampler = MinInstanceSampler(min_num_instances=3)
+        self.inference_dataloader = get_loader(
+            path=dataset_path,
+            dataset_name='monuseg',
+            patch_shape=(1, 512, 512),
             batch_size=1,
-            num_workers=8,
-            pin_memory=False,
-            shuffle=False,
-        )
+            split='train',
+            raw_transform=raw_transform,
+            sampler=sampler
+            )
 
     def __instantiate_logger(self) -> None:
         """Instantiate logger
@@ -256,13 +271,13 @@ class MoNuSegInference:
         rec_ds = []  # recall per image
 
         inference_loop = tqdm.tqdm(
-            enumerate(self.inference_dataloader), total=len(self.inference_dataloader)
+            enumerate(self.inference_dataloader), total=len(self.inference_dataloader) ### why do they even enumerate when not using the index in their version?
         )
 
         with torch.no_grad():
             for image_idx, batch in inference_loop:
                 image_metrics = self.inference_step(
-                    model=self.model, batch=batch, generate_plots=generate_plots
+                    model=self.model, batch=batch, generate_plots=generate_plots, image_index=f'{image_idx:04}' ### added image_idx and pass it to inference step for file naming
                 )
                 image_names.append(image_metrics["image_name"])
                 binary_dice_scores.append(image_metrics["binary_dice_score"])
@@ -298,7 +313,7 @@ class MoNuSegInference:
         [self.logger.info(f"{f'{k}:': <25} {v}") for k, v in dataset_metrics.items()]
 
     def inference_step(
-        self, model: nn.Module, batch: object, generate_plots: bool = False
+        self, model: nn.Module, batch: object, image_index, generate_plots: bool = False  ### added image_index as an argument for file name creation
     ) -> dict:
         """Inference step
 
@@ -312,11 +327,25 @@ class MoNuSegInference:
 
         """
         img = batch[0].to(self.device)
+        print(img.shape)
         if len(img.shape) > 4:
             img = img[0]
             img = rearrange(img, "c i j w h -> (i j) c w h")
-        mask = batch[1]
-        image_name = list(batch[2])
+        img = img.to(torch.float32)
+        if torch.max(img) >= 5:
+            print('Normalizing image')
+            img = img / 255
+        instance_map = batch[1]
+        image_name = f"{image_index}.tiff"  #list(batch[2]) ### CHANGE! since our batches only consist of (image, label), we do not give tissue_types or figure filenames
+        binary_map = (instance_map > 0).int()
+        binary_map_ = torch.squeeze(binary_map)
+        binary_map__ = torch.unsqueeze(binary_map_, dim=0)
+        mask = {                                            # their loader apparently returns a mask dictionary containing several maps, this dictionary is created here for our loader
+            "instance_map": torch.unsqueeze(torch.squeeze(instance_map), dim=0),
+            "nuclei_binary_map": binary_map__
+        }
+        print('instance_map shape: ', mask['instance_map'].shape)
+
         mask["instance_types"] = calculate_instances(
             torch.unsqueeze(mask["nuclei_binary_map"], dim=0), mask["instance_map"]
         )
@@ -361,7 +390,7 @@ class MoNuSegInference:
                 img = torch.unsqueeze(img, dim=0)
                 img = torch.permute(img, (0, 3, 1, 2))
             elif self.overlap != 0 and self.patching:
-                h, w = mask["nuclei_binary_map"].shape[1:]
+                h, w = mask['nuclei_binary_map'].shape[1:]   # changes mask["nuclei_binary_map"] to binary_map
                 total_img = torch.zeros((3, h, w))
                 decomposed_patch_num = int(np.sqrt(img.shape[0]))
                 for i in range(decomposed_patch_num):
@@ -377,7 +406,7 @@ class MoNuSegInference:
                 img=img,
                 predictions=predictions,
                 ground_truth=mask,
-                img_name=image_name[0],
+                img_name=image_name, # removed indexing that does not work for our image names
                 outdir=self.outdir,
                 scores=scores,
             )
@@ -1010,13 +1039,13 @@ class InferenceCellViTMoNuSegParser:
             "--patching",
             type=bool,
             help="Patch to 256px images. Default: False",
-            default=True,
+            default=False, # set patching to False as default, like the documentation suggests
         )
         parser.add_argument(
             "--overlap",
             type=int,
             help="Patch overlap, just valid for patching",
-            default=64,
+            default=0 # set overlap to default 0, as documented by the authors
         )
         parser.add_argument(
             "--plots",

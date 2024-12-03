@@ -1,4 +1,4 @@
-name: cellvit_env
+name: cellvit4
 channels:
   - conda-forge
   - defaults

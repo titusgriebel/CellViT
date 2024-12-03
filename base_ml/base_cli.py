@@ -44,10 +44,11 @@ class ExperimentBaseParser:
             formatter_class=argparse.ArgumentDefaultsHelpFormatter,
             description="Start an experiment with given configuration file.",
         )
-        requiredNamed = parser.add_argument_group("required named arguments")
-        requiredNamed.add_argument(
-            "--config", type=str, help="Path to a config file", required=True
-        )
+        # requiredNamed = parser.add_argument_group("required named arguments")
+        # # requiredNamed.add_argument(
+        # #     "--config", type=str, help="Path to a config file", required=True
+        # # )
+        parser.add_argument("--dataset"), type=str, help="Dataset name as specified in dataloaders"
         parser.add_argument("--gpu", type=int, help="Cuda-GPU ID")
         group = parser.add_mutually_exclusive_group(required=False)
         group.add_argument(

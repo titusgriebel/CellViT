@@ -21,7 +21,7 @@ sys.path.insert(0, parentdir)
 import uuid
 from pathlib import Path
 from typing import Callable, Tuple, Union
-
+from dataloader_util import get_loader
 import albumentations as A
 import torch
 import torch.nn as nn
@@ -178,40 +178,52 @@ class ExperimentCellViTCoNic(BaseExperiment):
                 )
 
         ### Data handling
-        train_transforms, val_transforms = self.get_transforms(
-            self.run_conf["transformations"],
-            input_shape=self.run_conf["data"].get("input_shape", 256),
-        )
+        # train_transforms, val_transforms = self.get_transforms(
+        #     self.run_conf["transformations"],
+        #     input_shape=self.run_conf["data"].get("input_shape", 256),
+        # )
 
-        train_dataset, val_dataset = self.get_datasets(
-            train_transforms=train_transforms,
-            val_transforms=val_transforms,
-        )
+        # train_dataset, val_dataset = self.get_datasets(
+        #     train_transforms=train_transforms,
+        #     val_transforms=val_transforms,
+        # )
 
-        # load sampler
-        training_sampler = self.get_sampler(
-            train_dataset=train_dataset,
-            strategy=self.run_conf["training"].get("sampling_strategy", "random"),
-            gamma=self.run_conf["training"].get("sampling_gamma", 1),
-        )
+        # # load sampler
+        # training_sampler = self.get_sampler(
+        #     train_dataset=train_dataset,
+        #     strategy=self.run_conf["training"].get("sampling_strategy", "random"),
+        #     gamma=self.run_conf["training"].get("sampling_gamma", 1),
+        # )
 
         # define dataloaders
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=self.run_conf["training"]["batch_size"],
-            sampler=training_sampler,
-            num_workers=16,
-            pin_memory=False,
-            worker_init_fn=self.seed_worker,
-        )
+        # train_dataloader = DataLoader(  --> dataloaders commented out since we are using our own
+        #     train_dataset,
+        #     batch_size=self.run_conf["training"]["batch_size"],
+        #     sampler=training_sampler,
+        #     num_workers=16,
+        #     pin_memory=False,
+        #     worker_init_fn=self.seed_worker,
+        # )
 
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=128,
-            num_workers=16,
-            pin_memory=True,
-            worker_init_fn=self.seed_worker,
-        )
+        # val_dataloader = DataLoader(
+        #     val_dataset,
+        #     batch_size=128,
+        #     num_workers=16,
+        #     pin_memory=True,
+        #     worker_init_fn=self.seed_worker,
+        # )
+        raw_transform = sam_training.identity
+
+        sampler = MinInstanceSampler(min_num_instances=3)
+        self.inference_dataloader = get_loader(
+            path=dataset_path,
+            dataset_name='monuseg',
+            patch_shape=(1, 512, 512),
+            batch_size=1,
+            split='test',
+            raw_transform=raw_transform,
+            sampler=sampler
+            )
 
         # start Training
         self.logger.info("Instantiate Trainer")
