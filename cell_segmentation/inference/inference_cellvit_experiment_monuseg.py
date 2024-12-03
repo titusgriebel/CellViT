@@ -11,7 +11,7 @@ import inspect
 import os
 import sys
 from dataloader_util import get_loader
-
+import tifffile as tiff
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
@@ -74,7 +74,8 @@ class MoNuSegInference:
     def __init__(
         self,
         model_path: Union[Path, str],
-        dataset_path: Union[Path, str],
+        dataset_name: Union[Path, str],
+        data_path,
         outdir: Union[Path, str],
         gpu: int,
         patching: bool = False,
@@ -96,35 +97,30 @@ class MoNuSegInference:
         self.model_path = Path(model_path)
         self.device = f"cuda:{gpu}"
         self.outdir = Path(outdir)
+        self.label_dir = os.path.join(outdir, dataset_name, 'inference_masks')
         self.outdir.mkdir(exist_ok=True, parents=True)
         self.magnification = magnification
         self.overlap = overlap
         self.patching = patching
+        self.outdir = os.path.join(outdir, dataset_name)
         if overlap > 0:
             assert patching, "Patching must be activated"
-
-        self.__instantiate_logger()
+        self.__instantiate_logger() 
         self.__load_model()
         self.__load_inference_transforms()
         self.__setup_amp()
-        self.inference_dataset = MoNuSegDataset(
-            dataset_path=dataset_path,
-            transforms=self.inference_transforms,
-            patching=patching,
-            overlap=overlap,
-        )
+        
         raw_transform = sam_training.identity
-
         sampler = MinInstanceSampler(min_num_instances=3)
         self.inference_dataloader = get_loader(
-            path=dataset_path,
-            dataset_name='monuseg',
+            path=data_path,
+            dataset_name=dataset_name,
             patch_shape=(1, 512, 512),
             batch_size=1,
-            split='train',
             raw_transform=raw_transform,
             sampler=sampler
             )
+        os.makedirs(self.label_dir, exist_ok=True)
 
     def __instantiate_logger(self) -> None:
         """Instantiate logger
@@ -270,7 +266,7 @@ class MoNuSegInference:
         with torch.no_grad():
             for image_idx, batch in inference_loop:
                 image_metrics = self.inference_step(
-                    model=self.model, batch=batch, generate_plots=generate_plots, image_index=f'{image_idx:04}'
+                    model=self.model, batch=batch, generate_plots=generate_plots, image_index=f'{(image_idx+1):04}'
                 )
                 image_names.append(image_metrics["image_name"])
                 binary_dice_scores.append(image_metrics["binary_dice_score"])
@@ -453,7 +449,11 @@ class MoNuSegInference:
             .detach()
             .cpu()
         )
-        remapped_instance_pred = remap_label(predictions["instance_map"]) ## TODO inference masks to extract
+        remapped_instance_pred = (remap_label(predictions["instance_map"])) ## TODO inference masks to extract --> done
+        prediction_mask = np.squeeze(remapped_instance_pred)
+        output_path = os.path.join(self.label_dir, image_name)
+        print('Mask shape and datatype: ', prediction_mask.shape, prediction_mask.dtype)
+        tiff.imwrite(output_path, prediction_mask)
         remapped_gt = remap_label(instance_maps_gt)
         [dq, sq, pq], _ = get_fast_pq(true=remapped_gt, pred=remapped_instance_pred)
 
@@ -1008,6 +1008,12 @@ class InferenceCellViTMoNuSegParser:
             default="/projects/datashare/tio/histopathology/public-datasets/MoNuSeg/1024/testing",
         )
         parser.add_argument(
+            "--data",
+            type=str,
+            help="Path where datasets are stored",
+            required=True
+        )
+        parser.add_argument(
             "--outdir",
             type=str,
             help="Path to output directory to store results.",
@@ -1056,7 +1062,8 @@ if __name__ == "__main__":
 
     inf = MoNuSegInference(
         model_path=configuration["model"],
-        dataset_path=configuration["dataset"],
+        dataset_name=configuration["dataset"],
+        data_path=configuration["data"],
         outdir=configuration["outdir"],
         gpu=configuration["gpu"],
         patching=configuration["patching"],

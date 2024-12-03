@@ -13,13 +13,9 @@ from torch_em.data.datasets import util
 import torch_em
 
 
-def get_loader(path, dataset_name, patch_shape, batch_size, split, **kwargs):
-    if split == 'train':
-        image_paths = natsorted(glob(os.path.join(path, dataset_name, 'loaded_dataset', 'complete_dataset', 'test2', 'test_images', '*.tiff')))
-        label_paths = natsorted(glob(os.path.join(path, dataset_name, 'loaded_dataset', 'complete_dataset', 'test2', 'test_labels', '*.tiff')))
-    elif split == 'val':
-        image_paths = natsorted(glob(os.path.join(path, dataset_name, 'loaded_dataset', 'complete_dataset', 'test2', 'val_images', '*.tiff')))
-        label_paths = natsorted(glob(os.path.join(path, dataset_name, 'loaded_dataset', 'complete_dataset', 'test2', 'val_labels', '*.tiff')))
+def get_loader(path, dataset_name, patch_shape, batch_size, **kwargs):
+    image_paths = natsorted(glob(os.path.join(path, dataset_name, 'loaded_dataset', 'complete_dataset', 'images', '*.tiff'))) 
+    label_paths = natsorted(glob(os.path.join(path, dataset_name, 'loaded_dataset', 'complete_dataset', 'labels', '*.tiff')))
     ds_kwargs, loader_kwargs = util.split_kwargs(torch_em.default_segmentation_dataset, **kwargs)
     dataset = torch_em.default_segmentation_dataset(
         raw_paths=image_paths,
