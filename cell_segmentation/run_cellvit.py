@@ -36,8 +36,6 @@ if __name__ == "__main__":
         experiment_class = ExperimentCellVitPanNuke
     elif configuration["data"]["dataset"].lower() == "conic":
         experiment_class = ExperimentCellViTCoNic
-    else:
-        
     # Setup experiment
     if "checkpoint" in configuration:
         # continue checkpoint
