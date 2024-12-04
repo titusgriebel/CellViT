@@ -13,8 +13,7 @@ import shutil
 import sys
 
 import yaml
-from torch_em.data import MinInstanceSampler
-import micro_sam.training as sam_training
+
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
@@ -22,6 +21,7 @@ sys.path.insert(0, parentdir)
 import uuid
 from pathlib import Path
 from typing import Callable, Tuple, Union
+
 import albumentations as A
 import torch
 import torch.nn as nn
@@ -195,8 +195,8 @@ class ExperimentCellViTCoNic(BaseExperiment):
             gamma=self.run_conf["training"].get("sampling_gamma", 1),
         )
 
-        define dataloaders
-        train_dataloader = DataLoader(  --> dataloaders commented out since we are using our own
+        # define dataloaders
+        train_dataloader = DataLoader(
             train_dataset,
             batch_size=self.run_conf["training"]["batch_size"],
             sampler=training_sampler,
@@ -271,10 +271,10 @@ class ExperimentCellViTCoNic(BaseExperiment):
         Args:
             dataset_path (Union[Path, str]): Path to dataset folder
         """
-        # dataset_config_path = Path(dataset_path) / "dataset_config.yaml"
-        # with open(dataset_config_path, "r") as dataset_config_file:
-        #     yaml_config = yaml.safe_load(dataset_config_file)
-        #     self.dataset_config = dict(yaml_config)
+        dataset_config_path = Path(dataset_path) / "dataset_config.yaml"
+        with open(dataset_config_path, "r") as dataset_config_file:
+            yaml_config = yaml.safe_load(dataset_config_file)
+            self.dataset_config = dict(yaml_config)
 
     def get_loss_fn(self, loss_fn_settings: dict) -> dict:
         """Create a dictionary with loss functions for all branches

@@ -1,116 +1,270 @@
 # -*- coding: utf-8 -*-
-# CellViT Inference Method for Patch-Wise Inference on a test set
-# Without merging WSI
-#
-# Aim is to calculate metrics as defined for the PanNuke dataset
+# CellVit Experiment Class
 #
 # @ Fabian Hörst, fabian.hoerst@uk-essen.de
 # Institute for Artifical Intelligence in Medicine,
 # University Medicine Essen
 
-import argparse
+import copy
+import datetime
 import inspect
 import os
+import shutil
 import sys
+
+import yaml
 
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
-parentdir = os.path.dirname(parentdir)
-sys.path.insert(0, parentdir)
 
-from base_ml.base_experiment import BaseExperiment
-
-BaseExperiment.seed_run(1232)
-
-import json
+import uuid
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import Callable, Tuple, Union
 
 import albumentations as A
-import numpy as np
 import torch
-import torch.nn.functional as F
-import tqdm
-import yaml
-from matplotlib import pyplot as plt
-from PIL import Image, ImageDraw
-from skimage.color import rgba2rgb
-from sklearn.metrics import accuracy_score
-from tabulate import tabulate
-from torch.utils.data import DataLoader
-from torchmetrics.functional import dice
-from torchmetrics.functional.classification import binary_jaccard_index
-from torchvision import transforms
-
-from cell_segmentation.datasets.dataset_coordinator import select_dataset
-from models.segmentation.cell_segmentation.cellvit import DataclassHVStorage
-from cell_segmentation.utils.metrics import (
-    cell_detection_scores,
-    cell_type_detection_scores,
-    get_fast_pq,
-    remap_label,
-    binarize,
+import torch.nn as nn
+import wandb
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import (
+    ConstantLR,
+    CosineAnnealingLR,
+    ExponentialLR,
+    SequentialLR,
+    _LRScheduler,
 )
-from cell_segmentation.utils.post_proc_cellvit import calculate_instances
-from cell_segmentation.utils.tools import cropping_center, pair_coordinates
+from torch.utils.data import (
+    DataLoader,
+    Dataset,
+    RandomSampler,
+    Sampler,
+    Subset,
+    WeightedRandomSampler,
+)
+from torchinfo import summary
+from wandb.sdk.lib.runid import generate_id
+
+from base_ml.base_early_stopping import EarlyStopping
+from base_ml.base_experiment import BaseExperiment
+from base_ml.base_loss import retrieve_loss_fn
+from base_ml.base_trainer import BaseTrainer
+from cell_segmentation.datasets.base_cell import CellDataset
+from cell_segmentation.datasets.dataset_coordinator import select_dataset
+from cell_segmentation.trainer.trainer_cellvit import CellViTTrainer
 from models.segmentation.cell_segmentation.cellvit import (
     CellViT,
-    CellViT256,
     CellViTSAM,
+    CellViT256,
 )
 from models.segmentation.cell_segmentation.cellvit_shared import (
+    CellViTShared,
     CellViT256Shared,
     CellViTSAMShared,
-    CellViTShared,
 )
-from utils.logger import Logger
+from utils.tools import close_logger
 
 
-class InferenceCellViT:
-    def __init__(
-        self,
-        run_dir: Union[Path, str],
-        gpu: int,
-        magnification: int = 40,
-        checkpoint_name: str = "model_best.pth",
-    ) -> None:
-        """Inference for HoverNet
+class ExperimentCellVitPanNuke(BaseExperiment):
+    def __init__(self, default_conf: dict, checkpoint=None) -> None:
+        super().__init__(default_conf, checkpoint)
+        self.load_dataset_setup(dataset_path=self.default_conf["data"]["dataset_path"])
 
-        Args:
-            run_dir (Union[Path, str]): logging directory with checkpoints and configs
-            gpu (int): CUDA GPU device to use for inference
-            magnification (int, optional): Dataset magnification. Defaults to 40.
-            checkpoint_name (str, optional): Select name of the model to load. Defaults to model_best.pth
-        """
-        self.run_dir = Path(run_dir)
-        self.device = f"cuda:{gpu}"
-        self.run_conf: dict = None
-        self.logger: Logger = None
-        self.magnification = magnification
-        self.checkpoint_name = checkpoint_name
+    def run_experiment(self) -> tuple[Path, dict, nn.Module, dict]:
+        """Main Experiment Code"""
+        ### Setup
+        # close loggers
+        self.close_remaining_logger()
 
-        self.__load_run_conf()
+        # get the config for the current run
+        self.run_conf = copy.deepcopy(self.default_conf)
+        self.run_conf["dataset_config"] = self.dataset_config
+        self.run_name = f"{datetime.datetime.now().strftime('%Y-%m-%dT%H%M%S')}_{self.run_conf['logging']['log_comment']}"
 
-        self.__load_dataset_setup(dataset_path=self.run_conf["data"]["dataset_path"])
-        self.__instantiate_logger()
-        self.__check_eval_model()
-        self.__setup_amp()
+        wandb_run_id = generate_id()
+        resume = None
+        if self.checkpoint is not None:
+            wandb_run_id = self.checkpoint["wandb_id"]
+            resume = "must"
+            self.run_name = self.checkpoint["run_name"]
 
-        self.logger.info(f"Loaded run: {run_dir}")
-        self.num_classes = self.run_conf["data"]["num_nuclei_classes"]
+        # initialize wandb
+        run = wandb.init(
+            project=self.run_conf["logging"]["project"],
+            tags=self.run_conf["logging"].get("tags", []),
+            name=self.run_name,
+            notes=self.run_conf["logging"]["notes"],
+            dir=self.run_conf["logging"]["wandb_dir"],
+            mode=self.run_conf["logging"]["mode"].lower(),
+            group=self.run_conf["logging"].get("group", str(uuid.uuid4())),
+            allow_val_change=True,
+            id=wandb_run_id,
+            resume=resume,
+            settings=wandb.Settings(start_method="fork"),
+        )
 
-    def __load_run_conf(self) -> None:
-        """Load the config.yaml file with the run setup
+        # get ids
+        self.run_conf["logging"]["run_id"] = run.id
+        self.run_conf["logging"]["wandb_file"] = run.id
 
-        Be careful with loading and usage, since original None values in the run configuration are not stored when dumped to yaml file.
-        If you want to check if a key is not defined, first check if the key does exists in the dict.
-        """
-        with open((self.run_dir / "config.yaml").resolve(), "r") as run_config_file:
-            yaml_config = yaml.safe_load(run_config_file)
-            self.run_conf = dict(yaml_config)
+        # overwrite configuration with sweep values are leave them as they are
+        if self.run_conf["run_sweep"] is True:
+            self.run_conf["logging"]["sweep_id"] = run.sweep_id
+            self.run_conf["logging"]["log_dir"] = str(
+                Path(self.default_conf["logging"]["log_dir"])
+                / f"sweep_{run.sweep_id}"
+                / f"{self.run_name}_{self.run_conf['logging']['run_id']}"
+            )
+            self.overwrite_sweep_values(self.run_conf, run.config)
+        else:
+            self.run_conf["logging"]["log_dir"] = str(
+                Path(self.default_conf["logging"]["log_dir"]) / self.run_name
+            )
 
-    def __load_dataset_setup(self, dataset_path: Union[Path, str]) -> None:
+        # update wandb
+        wandb.config.update(
+            self.run_conf, allow_val_change=True
+        )  # this may lead to the problem
+
+        # create output folder, instantiate logger and store config
+        self.create_output_dir(self.run_conf["logging"]["log_dir"])
+        self.logger = self.instantiate_logger()
+        self.logger.info("Instantiated Logger. WandB init and config update finished.")
+        self.logger.info(f"Run ist stored here: {self.run_conf['logging']['log_dir']}")
+        self.store_config()
+
+        self.logger.info(
+            f"Cuda devices: {[torch.cuda.device(i) for i in range(torch.cuda.device_count())]}"
+        )
+        ### Machine Learning
+        device = f"cuda:{self.run_conf['gpu']}"
+        self.logger.info(f"Using GPU: {device}")
+        self.logger.info(f"Using device: {device}")
+
+        # loss functions
+        loss_fn_dict = self.get_loss_fn(self.run_conf.get("loss", {}))
+        self.logger.info("Loss functions:")
+        self.logger.info(loss_fn_dict)
+
+        # model
+        model = self.get_train_model(
+            pretrained_encoder=self.run_conf["model"].get("pretrained_encoder", None),
+            pretrained_model=self.run_conf["model"].get("pretrained", None),
+            backbone_type=self.run_conf["model"].get("backbone", "default"),
+            shared_decoders=self.run_conf["model"].get("shared_decoders", False),
+            regression_loss=self.run_conf["model"].get("regression_loss", False),
+        )
+        model.to(device)
+
+        # optimizer
+        optimizer = self.get_optimizer(
+            model,
+            self.run_conf["training"]["optimizer"],
+            self.run_conf["training"]["optimizer_hyperparameter"],
+        )
+
+        # scheduler
+        scheduler = self.get_scheduler(
+            optimizer=optimizer,
+            scheduler_type=self.run_conf["training"]["scheduler"]["scheduler_type"],
+        )
+
+        # early stopping (no early stopping for basic setup)
+        early_stopping = None
+        if "early_stopping_patience" in self.run_conf["training"]:
+            if self.run_conf["training"]["early_stopping_patience"] is not None:
+                early_stopping = EarlyStopping(
+                    patience=self.run_conf["training"]["early_stopping_patience"],
+                    strategy="maximize",
+                )
+
+        ### Data handling
+        train_transforms, val_transforms = self.get_transforms(
+            self.run_conf["transformations"],
+            input_shape=self.run_conf["data"].get("input_shape", 256),
+        )
+
+        train_dataset, val_dataset = self.get_datasets(
+            train_transforms=train_transforms,
+            val_transforms=val_transforms,
+        )
+
+        # load sampler
+        training_sampler = self.get_sampler(
+            train_dataset=train_dataset,
+            strategy=self.run_conf["training"].get("sampling_strategy", "random"),
+            gamma=self.run_conf["training"].get("sampling_gamma", 1),
+        )
+
+        # define dataloaders
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=self.run_conf["training"]["batch_size"],
+            sampler=training_sampler,
+            num_workers=16,
+            pin_memory=False,
+            worker_init_fn=self.seed_worker,
+        )
+
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=128,
+            num_workers=16,
+            pin_memory=True,
+            worker_init_fn=self.seed_worker,
+        )
+
+        # start Training
+        self.logger.info("Instantiate Trainer")
+        trainer_fn = self.get_trainer()
+        trainer = trainer_fn(
+            model=model,
+            loss_fn_dict=loss_fn_dict,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            logger=self.logger,
+            logdir=self.run_conf["logging"]["log_dir"],
+            num_classes=self.run_conf["data"]["num_nuclei_classes"],
+            dataset_config=self.dataset_config,
+            early_stopping=early_stopping,
+            experiment_config=self.run_conf,
+            log_images=self.run_conf["logging"].get("log_images", False),
+            magnification=self.run_conf["data"].get("magnification", 40),
+            mixed_precision=self.run_conf["training"].get("mixed_precision", False),
+        )
+
+        # Load checkpoint if provided
+        if self.checkpoint is not None:
+            self.logger.info("Checkpoint was provided. Restore ...")
+            trainer.resume_checkpoint(self.checkpoint)
+
+        # Call fit method
+        self.logger.info("Calling Trainer Fit")
+        trainer.fit(
+            epochs=self.run_conf["training"]["epochs"],
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader,
+            metric_init=self.get_wandb_init_dict(),
+            unfreeze_epoch=self.run_conf["training"]["unfreeze_epoch"],
+            eval_every=self.run_conf["training"].get("eval_every", 1),
+        )
+
+        # Select best model if not provided by early stopping
+        checkpoint_dir = Path(self.run_conf["logging"]["log_dir"]) / "checkpoints"
+        if not (checkpoint_dir / "model_best.pth").is_file():
+            shutil.copy(
+                checkpoint_dir / "latest_checkpoint.pth",
+                checkpoint_dir / "model_best.pth",
+            )
+
+        # At the end close logger
+        self.logger.info(f"Finished run {run.id}")
+        close_logger(self.logger)
+
+        return self.run_conf["logging"]["log_dir"]
+
+    def load_dataset_setup(self, dataset_path: Union[Path, str]) -> None:
         """Load the configuration of the cell segmentation dataset.
 
         The dataset must have a dataset_config.yaml file in their dataset path with the following entries:
@@ -125,64 +279,293 @@ class InferenceCellViT:
             yaml_config = yaml.safe_load(dataset_config_file)
             self.dataset_config = dict(yaml_config)
 
-    def __instantiate_logger(self) -> None:
-        """Instantiate logger
+    def get_loss_fn(self, loss_fn_settings: dict) -> dict:
+        """Create a dictionary with loss functions for all branches
 
-        Logger is using no formatters. Logs are stored in the run directory under the filename: inference.log
-        """
-        logger = Logger(
-            level=self.run_conf["logging"]["level"].upper(),
-            log_dir=Path(self.run_dir).resolve(),
-            comment="inference",
-            use_timestamp=False,
-            formatter="%(message)s",
-        )
-        self.logger = logger.create_logger()
-
-    def __check_eval_model(self) -> None:
-        """Check if there is a best model pytorch file"""
-        assert (self.run_dir / "checkpoints" / self.checkpoint_name).is_file()
-
-    def __setup_amp(self) -> None:
-        """Setup automated mixed precision (amp) for inference."""
-        self.mixed_precision = self.run_conf["training"].get("mixed_precision", False)
-
-    def get_model(
-        self, model_type: str
-    ) -> Union[
-        CellViT,
-        CellViTShared,
-        CellViT256,
-        CellViT256Shared,
-        CellViTSAM,
-        CellViTSAMShared,
-    ]:
-        """Return the trained model for inference
+        Branches: "nuclei_binary_map", "hv_map", "nuclei_type_map", "tissue_types"
 
         Args:
-            model_type (str): Name of the model. Must either be one of:
-                CellViT, CellViTShared, CellViT256, CellViT256Shared, CellViTSAM, CellViTSAMShared
+            loss_fn_settings (dict): Dictionary with the loss function settings. Structure
+            branch_name(str):
+                loss_name(str):
+                    loss_fn(str): String matching to the loss functions defined in the LOSS_DICT (base_ml.base_loss)
+                    weight(float): Weighting factor as float value
+                    (optional) args:  Optional parameters for initializing the loss function
+                            arg_name: value
+
+            If a branch is not provided, the defaults settings (described below) are used.
+
+            For further information, please have a look at the file configs/examples/cell_segmentation/train_cellvit.yaml
+            under the section "loss"
+
+            Example:
+                  nuclei_binary_map:
+                    bce:
+                        loss_fn: xentropy_loss
+                        weight: 1
+                    dice:
+                        loss_fn: dice_loss
+                        weight: 1
 
         Returns:
-            Union[CellViT, CellViTShared, CellViT256, CellViT256Shared, CellViTSAM, CellViTSAMShared]: Model
+            dict: Dictionary with loss functions for each branch. Structure:
+                branch_name(str):
+                    loss_name(str):
+                        "loss_fn": Callable loss function
+                        "weight": weight of the loss since in the end all losses of all branches are added together for backward pass
+                    loss_name(str):
+                        "loss_fn": Callable loss function
+                        "weight": weight of the loss since in the end all losses of all branches are added together for backward pass
+                branch_name(str)
+                ...
+
+        Default loss dictionary:
+            nuclei_binary_map:
+                bce:
+                    loss_fn: xentropy_loss
+                    weight: 1
+                dice:
+                    loss_fn: dice_loss
+                    weight: 1
+            hv_map:
+                mse:
+                    loss_fn: mse_loss_maps
+                    weight: 1
+                msge:
+                    loss_fn: msge_loss_maps
+                    weight: 1
+            nuclei_type_map
+                bce:
+                    loss_fn: xentropy_loss
+                    weight: 1
+                dice:
+                    loss_fn: dice_loss
+                    weight: 1
+            tissue_types
+                ce:
+                    loss_fn: nn.CrossEntropyLoss()
+                    weight: 1
         """
-        implemented_models = [
-            "CellViT",
-            "CellViTShared",
-            "CellViT256",
-            "CellViT256Shared",
-            "CellViTSAM",
-            "CellViTSAMShared",
-        ]
-        if model_type not in implemented_models:
-            raise NotImplementedError(
-                f"Unknown model type. Please select one of {implemented_models}"
+        loss_fn_dict = {}
+        if "nuclei_binary_map" in loss_fn_settings.keys():
+            loss_fn_dict["nuclei_binary_map"] = {}
+            for loss_name, loss_sett in loss_fn_settings["nuclei_binary_map"].items():
+                parameters = loss_sett.get("args", {})
+                loss_fn_dict["nuclei_binary_map"][loss_name] = {
+                    "loss_fn": retrieve_loss_fn(loss_sett["loss_fn"], **parameters),
+                    "weight": loss_sett["weight"],
+                }
+        else:
+            loss_fn_dict["nuclei_binary_map"] = {
+                "bce": {"loss_fn": retrieve_loss_fn("xentropy_loss"), "weight": 1},
+                "dice": {"loss_fn": retrieve_loss_fn("dice_loss"), "weight": 1},
+            }
+        if "hv_map" in loss_fn_settings.keys():
+            loss_fn_dict["hv_map"] = {}
+            for loss_name, loss_sett in loss_fn_settings["hv_map"].items():
+                parameters = loss_sett.get("args", {})
+                loss_fn_dict["hv_map"][loss_name] = {
+                    "loss_fn": retrieve_loss_fn(loss_sett["loss_fn"], **parameters),
+                    "weight": loss_sett["weight"],
+                }
+        else:
+            loss_fn_dict["hv_map"] = {
+                "mse": {"loss_fn": retrieve_loss_fn("mse_loss_maps"), "weight": 1},
+                "msge": {"loss_fn": retrieve_loss_fn("msge_loss_maps"), "weight": 1},
+            }
+        if "nuclei_type_map" in loss_fn_settings.keys():
+            loss_fn_dict["nuclei_type_map"] = {}
+            for loss_name, loss_sett in loss_fn_settings["nuclei_type_map"].items():
+                parameters = loss_sett.get("args", {})
+                loss_fn_dict["nuclei_type_map"][loss_name] = {
+                    "loss_fn": retrieve_loss_fn(loss_sett["loss_fn"], **parameters),
+                    "weight": loss_sett["weight"],
+                }
+        else:
+            loss_fn_dict["nuclei_type_map"] = {
+                "bce": {"loss_fn": retrieve_loss_fn("xentropy_loss"), "weight": 1},
+                "dice": {"loss_fn": retrieve_loss_fn("dice_loss"), "weight": 1},
+            }
+        if "tissue_types" in loss_fn_settings.keys():
+            loss_fn_dict["tissue_types"] = {}
+            for loss_name, loss_sett in loss_fn_settings["tissue_types"].items():
+                parameters = loss_sett.get("args", {})
+                loss_fn_dict["tissue_types"][loss_name] = {
+                    "loss_fn": retrieve_loss_fn(loss_sett["loss_fn"], **parameters),
+                    "weight": loss_sett["weight"],
+                }
+        else:
+            loss_fn_dict["tissue_types"] = {
+                "ce": {"loss_fn": nn.CrossEntropyLoss(), "weight": 1},
+            }
+        if "regression_loss" in loss_fn_settings.keys():
+            loss_fn_dict["regression_map"] = {}
+            for loss_name, loss_sett in loss_fn_settings["regression_loss"].items():
+                parameters = loss_sett.get("args", {})
+                loss_fn_dict["regression_map"][loss_name] = {
+                    "loss_fn": retrieve_loss_fn(loss_sett["loss_fn"], **parameters),
+                    "weight": loss_sett["weight"],
+                }
+        elif "regression_loss" in self.run_conf["model"].keys():
+            loss_fn_dict["regression_map"] = {
+                "mse": {"loss_fn": retrieve_loss_fn("mse_loss_maps"), "weight": 1},
+            }
+        return loss_fn_dict
+
+    def get_scheduler(self, scheduler_type: str, optimizer: Optimizer) -> _LRScheduler:
+        """Get the learning rate scheduler for CellViT
+
+        The configuration of the scheduler is given in the "training" -> "scheduler" section.
+        Currenlty, "constant", "exponential" and "cosine" schedulers are implemented.
+
+        Required parameters for implemented schedulers:
+            - "constant": None
+            - "exponential": gamma (optional, defaults to 0.95)
+            - "cosine": eta_min (optional, defaults to 1-e5)
+
+        Args:
+            scheduler_type (str): Type of scheduler as a string. Currently implemented:
+                - "constant" (lowering by a factor of ten after 25 epochs, increasing after 50, decreasimg again after 75)
+                - "exponential" (ExponentialLR with given gamma, gamma defaults to 0.95)
+                - "cosine" (CosineAnnealingLR, eta_min as parameter, defaults to 1-e5)
+            optimizer (Optimizer): Optimizer
+
+        Returns:
+            _LRScheduler: PyTorch Scheduler
+        """
+        implemented_schedulers = ["constant", "exponential", "cosine"]
+        if scheduler_type.lower() not in implemented_schedulers:
+            self.logger.warning(
+                f"Unknown Scheduler - No scheduler from the list {implemented_schedulers} select. Using default scheduling."
             )
-        if model_type in ["CellViT", "CellViTShared"]:
-            if model_type == "CellViT":
-                model_class = CellViT
-            elif model_type == "CellViTShared":
+        if scheduler_type.lower() == "constant":
+            scheduler = SequentialLR(
+                optimizer=optimizer,
+                schedulers=[
+                    ConstantLR(optimizer, factor=1, total_iters=25),
+                    ConstantLR(optimizer, factor=0.1, total_iters=25),
+                    ConstantLR(optimizer, factor=1, total_iters=25),
+                    ConstantLR(optimizer, factor=0.1, total_iters=1000),
+                ],
+                milestones=[24, 49, 74],
+            )
+        elif scheduler_type.lower() == "exponential":
+            scheduler = ExponentialLR(
+                optimizer,
+                gamma=self.run_conf["training"]["scheduler"].get("gamma", 0.95),
+            )
+        elif scheduler_type.lower() == "cosine":
+            scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=self.run_conf["training"]["epochs"],
+                eta_min=self.run_conf["training"]["scheduler"].get("eta_min", 1e-5),
+            )
+        else:
+            scheduler = super().get_scheduler(optimizer)
+        return scheduler
+
+    def get_datasets(
+        self,
+        train_transforms: Callable = None,
+        val_transforms: Callable = None,
+    ) -> Tuple[Dataset, Dataset]:
+        """Retrieve training dataset and validation dataset
+
+        Args:
+            train_transforms (Callable, optional): PyTorch transformations for train set. Defaults to None.
+            val_transforms (Callable, optional): PyTorch transformations for validation set. Defaults to None.
+
+        Returns:
+            Tuple[Dataset, Dataset]: Training dataset and validation dataset
+        """
+        if (
+            "val_split" in self.run_conf["data"]
+            and "val_folds" in self.run_conf["data"]
+        ):
+            raise RuntimeError(
+                "Provide either val_splits or val_folds in configuration file, not both."
+            )
+        if (
+            "val_split" not in self.run_conf["data"]
+            and "val_folds" not in self.run_conf["data"]
+        ):
+            raise RuntimeError(
+                "Provide either val_split or val_folds in configuration file, one is necessary."
+            )
+        if (
+            "val_split" not in self.run_conf["data"]
+            and "val_folds" not in self.run_conf["data"]
+        ):
+            raise RuntimeError(
+                "Provide either val_split or val_fold in configuration file, one is necessary."
+            )
+        if "regression_loss" in self.run_conf["model"].keys():
+            self.run_conf["data"]["regression_loss"] = True
+
+        full_dataset = select_dataset(
+            dataset_name="pannuke",
+            split="train",
+            dataset_config=self.run_conf["data"],
+            transforms=train_transforms,
+        )
+        if "val_split" in self.run_conf["data"]:
+            generator_split = torch.Generator().manual_seed(
+                self.default_conf["random_seed"]
+            )
+            val_splits = float(self.run_conf["data"]["val_split"])
+            train_dataset, val_dataset = torch.utils.data.random_split(
+                full_dataset,
+                lengths=[1 - val_splits, val_splits],
+                generator=generator_split,
+            )
+            val_dataset.dataset = copy.deepcopy(full_dataset)
+            val_dataset.dataset.set_transforms(val_transforms)
+        else:
+            train_dataset = full_dataset
+            val_dataset = select_dataset(
+                dataset_name="pannuke",
+                split="validation",
+                dataset_config=self.run_conf["data"],
+                transforms=val_transforms,
+            )
+
+        return train_dataset, val_dataset
+
+    def get_train_model(
+        self,
+        pretrained_encoder: Union[Path, str] = None,
+        pretrained_model: Union[Path, str] = None,
+        backbone_type: str = "default",
+        shared_decoders: bool = False,
+        regression_loss: bool = False,
+        **kwargs,
+    ) -> CellViT:
+        """Return the CellViT training model
+
+        Args:
+            pretrained_encoder (Union[Path, str]): Path to a pretrained encoder. Defaults to None.
+            pretrained_model (Union[Path, str], optional): Path to a pretrained model. Defaults to None.
+            backbone_type (str, optional): Backbone Type. Currently supported are default (None, ViT256, SAM-B, SAM-L, SAM-H). Defaults to None
+            shared_decoders (bool, optional): If shared skip decoders should be used. Defaults to False.
+            regression_loss (bool, optional): If regression loss is used. Defaults to False
+
+        Returns:
+            CellViT: CellViT training model with given setup
+        """
+        # reseed needed, due to subprocess seeding compatibility
+        self.seed_run(self.default_conf["random_seed"])
+
+        # check for backbones
+        implemented_backbones = ["default", "vit256", "sam-b", "sam-l", "sam-h"]
+        if backbone_type.lower() not in implemented_backbones:
+            raise NotImplementedError(
+                f"Unknown Backbone Type - Currently supported are: {implemented_backbones}"
+            )
+        if backbone_type.lower() == "default":
+            if shared_decoders:
                 model_class = CellViTShared
+            else:
+                model_class = CellViT
             model = model_class(
                 num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
                 num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
@@ -191,1074 +574,275 @@ class InferenceCellViT:
                 depth=self.run_conf["model"]["depth"],
                 num_heads=self.run_conf["model"]["num_heads"],
                 extract_layers=self.run_conf["model"]["extract_layers"],
-                regression_loss=self.run_conf["model"].get("regression_loss", False),
+                drop_rate=self.run_conf["training"].get("drop_rate", 0),
+                attn_drop_rate=self.run_conf["training"].get("attn_drop_rate", 0),
+                drop_path_rate=self.run_conf["training"].get("drop_path_rate", 0),
+                regression_loss=regression_loss,
             )
 
-        elif model_type in ["CellViT256", "CellViT256Shared"]:
-            if model_type == "CellViT256":
-                model_class = CellViT256
-            elif model_type == "CellViT256Shared":
+            if pretrained_model is not None:
+                self.logger.info(
+                    f"Loading pretrained CellViT model from path: {pretrained_model}"
+                )
+                cellvit_pretrained = torch.load(pretrained_model)
+                self.logger.info(model.load_state_dict(cellvit_pretrained, strict=True))
+                self.logger.info("Loaded CellViT model")
+
+        if backbone_type.lower() == "vit256":
+            if shared_decoders:
                 model_class = CellViT256Shared
+            else:
+                model_class = CellViT256
             model = model_class(
-                model256_path=None,
+                model256_path=pretrained_encoder,
                 num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
                 num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
-                regression_loss=self.run_conf["model"].get("regression_loss", False),
+                drop_rate=self.run_conf["training"].get("drop_rate", 0),
+                attn_drop_rate=self.run_conf["training"].get("attn_drop_rate", 0),
+                drop_path_rate=self.run_conf["training"].get("drop_path_rate", 0),
+                regression_loss=regression_loss,
             )
-        elif model_type in ["CellViTSAM", "CellViTSAMShared"]:
-            if model_type == "CellViTSAM":
-                model_class = CellViTSAM
-            elif model_type == "CellViTSAMShared":
+            model.load_pretrained_encoder(model.model256_path)
+            if pretrained_model is not None:
+                self.logger.info(
+                    f"Loading pretrained CellViT model from path: {pretrained_model}"
+                )
+                cellvit_pretrained = torch.load(pretrained_model, map_location="cpu")
+                self.logger.info(model.load_state_dict(cellvit_pretrained, strict=True))
+            model.freeze_encoder()
+            self.logger.info("Loaded CellVit256 model")
+        if backbone_type.lower() in ["sam-b", "sam-l", "sam-h"]:
+            if shared_decoders:
                 model_class = CellViTSAMShared
+            else:
+                model_class = CellViTSAM
             model = model_class(
-                model_path=None,
+                model_path=pretrained_encoder,
                 num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
                 num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
-                vit_structure=self.run_conf["model"]["backbone"],
-                regression_loss=self.run_conf["model"].get("regression_loss", False),
+                vit_structure=backbone_type,
+                drop_rate=self.run_conf["training"].get("drop_rate", 0),
+                regression_loss=regression_loss,
             )
+            model.load_pretrained_encoder(model.model_path)
+            if pretrained_model is not None:
+                self.logger.info(
+                    f"Loading pretrained CellViT model from path: {pretrained_model}"
+                )
+                cellvit_pretrained = torch.load(pretrained_model, map_location="cpu")
+                self.logger.info(model.load_state_dict(cellvit_pretrained, strict=True))
+            model.freeze_encoder()
+            self.logger.info(f"Loaded CellViT-SAM model with backbone: {backbone_type}")
+
+        self.logger.info(f"\nModel: {model}")
+        model = model.to("cpu")
+        self.logger.info(
+            f"\n{summary(model, input_size=(1, 3, 256, 256), device='cpu')}"
+        )
+
         return model
 
-    def setup_patch_inference(
-        self, test_folds: List[int] = None
-    ) -> tuple[
-        Union[
-            CellViT,
-            CellViTShared,
-            CellViT256,
-            CellViT256Shared,
-            CellViTSAM,
-            CellViTSAMShared,
-        ],
-        DataLoader,
-        dict,
-    ]:
-        """Setup patch inference by defining a patch-wise datalaoder and loading the model checkpoint
+    def get_wandb_init_dict(self) -> dict:
+        pass
+
+    def get_transforms(
+        self, transform_settings: dict, input_shape: int = 256
+    ) -> Tuple[Callable, Callable]:
+        """Get Transformations (Albumentation Transformations). Return both training and validation transformations.
+
+        The transformation settings are given in the following format:
+            key: dict with parameters
+        Example:
+            colorjitter:
+                p: 0.1
+                scale_setting: 0.5
+                scale_color: 0.1
+
+        For further information on how to setup the dictionary and default (recommended) values is given here:
+        configs/examples/cell_segmentation/train_cellvit.yaml
+
+        Training Transformations:
+            Implemented are:
+                - A.RandomRotate90: Key in transform_settings: randomrotate90, parameters: p
+                - A.HorizontalFlip: Key in transform_settings: horizontalflip, parameters: p
+                - A.VerticalFlip: Key in transform_settings: verticalflip, parameters: p
+                - A.Downscale: Key in transform_settings: downscale, parameters: p, scale
+                - A.Blur: Key in transform_settings: blur, parameters: p, blur_limit
+                - A.GaussNoise: Key in transform_settings: gaussnoise, parameters: p, var_limit
+                - A.ColorJitter: Key in transform_settings: colorjitter, parameters: p, scale_setting, scale_color
+                - A.Superpixels: Key in transform_settings: superpixels, parameters: p
+                - A.ZoomBlur: Key in transform_settings: zoomblur, parameters: p
+                - A.RandomSizedCrop: Key in transform_settings: randomsizedcrop, parameters: p
+                - A.ElasticTransform: Key in transform_settings: elastictransform, parameters: p
+            Always implemented at the end of the pipeline:
+                - A.Normalize with given mean (default: (0.5, 0.5, 0.5)) and std (default: (0.5, 0.5, 0.5))
+
+        Validation Transformations:
+            A.Normalize with given mean (default: (0.5, 0.5, 0.5)) and std (default: (0.5, 0.5, 0.5))
 
         Args:
-            test_folds (List[int], optional): Test fold to use. Otherwise defined folds from config.yaml (in run_dir) are loaded. Defaults to None.
+            transform_settings (dict): dictionay with the transformation settings.
+            input_shape (int, optional): Input shape of the images to used. Defaults to 256.
 
         Returns:
-            tuple[Union[CellViT, CellViTShared, CellViT256, CellViT256Shared, CellViTSAM, CellViTSAMShared], DataLoader, dict]:
-                Union[CellViT, CellViTShared, CellViT256, CellViT256Shared, CellViTSAM, CellViTSAMShared]: Best model loaded form checkpoint
-                DataLoader: Inference DataLoader
-                dict: Dataset configuration. Keys are:
-                    * "tissue_types": describing the present tissue types with corresponding integer
-                    * "nuclei_types": describing the present nuclei types with corresponding integer
+            Tuple[Callable, Callable]: Train Transformations, Validation Transformations
 
         """
-        # get model for inference
-        checkpoint = torch.load(
-            self.run_dir / "checkpoints" / self.checkpoint_name, map_location="cpu"
-        )
-        model = self.get_model(model_type=checkpoint["arch"])
-        self.logger.info(
-            f"Loading best model from {str(self.run_dir / 'checkpoints' / self.checkpoint_name)}"
-        )
-        self.logger.info(model.load_state_dict(checkpoint["model_state_dict"]))
-
-        # get dataset
-        if test_folds is None:
-            if "test_folds" in self.run_conf["data"]:
-                if self.run_conf["data"]["test_folds"] is None:
-                    self.logger.info(
-                        "There was no test set provided. We now use the validation dataset for testing"
-                    )
-                    self.run_conf["data"]["test_folds"] = self.run_conf["data"][
-                        "val_folds"
-                    ]
-            else:
-                self.logger.info(
-                    "There was no test set provided. We now use the validation dataset for testing"
+        transform_list = []
+        transform_settings = {k.lower(): v for k, v in transform_settings.items()}
+        if "RandomRotate90".lower() in transform_settings:
+            p = transform_settings["randomrotate90"]["p"]
+            if p > 0 and p <= 1:
+                transform_list.append(A.RandomRotate90(p=p))
+        if "HorizontalFlip".lower() in transform_settings.keys():
+            p = transform_settings["horizontalflip"]["p"]
+            if p > 0 and p <= 1:
+                transform_list.append(A.HorizontalFlip(p=p))
+        if "VerticalFlip".lower() in transform_settings:
+            p = transform_settings["verticalflip"]["p"]
+            if p > 0 and p <= 1:
+                transform_list.append(A.VerticalFlip(p=p))
+        if "Downscale".lower() in transform_settings:
+            p = transform_settings["downscale"]["p"]
+            scale = transform_settings["downscale"]["scale"]
+            if p > 0 and p <= 1:
+                transform_list.append(
+                    A.Downscale(p=p, scale_max=scale, scale_min=scale)
                 )
-                self.run_conf["data"]["test_folds"] = self.run_conf["data"]["val_folds"]
-        else:
-            self.run_conf["data"]["test_folds"] = self.run_conf["data"]["val_folds"]
-        self.logger.info(
-            f"Performing Inference on test set: {self.run_conf['data']['test_folds']}"
-        )
+        if "Blur".lower() in transform_settings:
+            p = transform_settings["blur"]["p"]
+            blur_limit = transform_settings["blur"]["blur_limit"]
+            if p > 0 and p <= 1:
+                transform_list.append(A.Blur(p=p, blur_limit=blur_limit))
+        if "GaussNoise".lower() in transform_settings:
+            p = transform_settings["gaussnoise"]["p"]
+            var_limit = transform_settings["gaussnoise"]["var_limit"]
+            if p > 0 and p <= 1:
+                transform_list.append(A.GaussNoise(p=p, var_limit=var_limit))
+        if "ColorJitter".lower() in transform_settings:
+            p = transform_settings["colorjitter"]["p"]
+            scale_setting = transform_settings["colorjitter"]["scale_setting"]
+            scale_color = transform_settings["colorjitter"]["scale_color"]
+            if p > 0 and p <= 1:
+                transform_list.append(
+                    A.ColorJitter(
+                        p=p,
+                        brightness=scale_setting,
+                        contrast=scale_setting,
+                        saturation=scale_color,
+                        hue=scale_color / 2,
+                    )
+                )
+        if "Superpixels".lower() in transform_settings:
+            p = transform_settings["superpixels"]["p"]
+            if p > 0 and p <= 1:
+                transform_list.append(
+                    A.Superpixels(
+                        p=p,
+                        p_replace=0.1,
+                        n_segments=200,
+                        max_size=int(input_shape / 2),
+                    )
+                )
+        if "ZoomBlur".lower() in transform_settings:
+            p = transform_settings["zoomblur"]["p"]
+            if p > 0 and p <= 1:
+                transform_list.append(A.ZoomBlur(p=p, max_factor=1.05))
+        if "RandomSizedCrop".lower() in transform_settings:
+            p = transform_settings["randomsizedcrop"]["p"]
+            if p > 0 and p <= 1:
+                transform_list.append(
+                    A.RandomSizedCrop(
+                        min_max_height=(input_shape / 2, input_shape),
+                        height=input_shape,
+                        width=input_shape,
+                        p=p,
+                    )
+                )
+        if "ElasticTransform".lower() in transform_settings:
+            p = transform_settings["elastictransform"]["p"]
+            if p > 0 and p <= 1:
+                transform_list.append(
+                    A.ElasticTransform(p=p, sigma=25, alpha=0.5, alpha_affine=15)
+                )
 
-        transform_settings = self.run_conf["transformations"]
         if "normalize" in transform_settings:
             mean = transform_settings["normalize"].get("mean", (0.5, 0.5, 0.5))
             std = transform_settings["normalize"].get("std", (0.5, 0.5, 0.5))
         else:
             mean = (0.5, 0.5, 0.5)
             std = (0.5, 0.5, 0.5)
-        transforms = A.Compose([A.Normalize(mean=mean, std=std)])
+        transform_list.append(A.Normalize(mean=mean, std=std))
 
-        inference_dataset = select_dataset(
-            dataset_name=self.run_conf["data"]["dataset"],
-            split="test",
-            dataset_config=self.run_conf["data"],
-            transforms=transforms,
-        )
+        train_transforms = A.Compose(transform_list)
+        val_transforms = A.Compose([A.Normalize(mean=mean, std=std)])
 
-        inference_dataloader = DataLoader(
-            inference_dataset,
-            batch_size=128,
-            num_workers=12,
-            pin_memory=False,
-            shuffle=False,
-        )
+        return train_transforms, val_transforms
 
-        return model, inference_dataloader, self.dataset_config
-
-    def run_patch_inference(
-        self,
-        model: Union[
-            CellViT,
-            CellViTShared,
-            CellViT256,
-            CellViT256Shared,
-            CellViTSAM,
-            CellViTSAMShared,
-        ],
-        inference_dataloader: DataLoader,
-        dataset_config: dict,
-        generate_plots: bool = False,
-    ) -> None:
-        """Run Patch inference with given setup
+    def get_sampler(
+        self, train_dataset: CellDataset, strategy: str = "random", gamma: float = 1
+    ) -> Sampler:
+        """Return the sampler (either RandomSampler or WeightedRandomSampler)
 
         Args:
-            model (Union[CellViT, CellViTShared, CellViT256, CellViT256Shared, CellViTSAM, CellViTSAMShared]): Model to use for inference
-            inference_dataloader (DataLoader): Inference Dataloader. Must return a batch with the following structure:
-                * Images (torch.Tensor)
-                * Masks (dict)
-                * Tissue types as str
-                * Image name as str
-            dataset_config (dict): Dataset configuration. Required keys are:
-                    * "tissue_types": describing the present tissue types with corresponding integer
-                    * "nuclei_types": describing the present nuclei types with corresponding integer
-            generate_plots (bool, optional): If inference plots should be generated. Defaults to False.
-        """
-        # put model in eval mode
-        model.to(device=self.device)
-        model.eval()
+            train_dataset (CellDataset): Dataset for training
+            strategy (str, optional): Sampling strategy. Defaults to "random" (random sampling).
+                Implemented are "random", "cell", "tissue", "cell+tissue".
+            gamma (float, optional): Gamma scaling factor, between 0 and 1.
+                1 means total balancing, 0 means original weights. Defaults to 1.
 
-        # setup score tracker
-        image_names = []  # image names as str
-        binary_dice_scores = []  # binary dice scores per image
-        binary_jaccard_scores = []  # binary jaccard scores per image
-        pq_scores = []  # pq-scores per image
-        dq_scores = []  # dq-scores per image
-        sq_scores = []  # sq-scores per image
-        cell_type_pq_scores = []  # pq-scores per cell type and image
-        cell_type_dq_scores = []  # dq-scores per cell type and image
-        cell_type_sq_scores = []  # sq-scores per cell type and image
-        tissue_pred = []  # tissue predictions for each image
-        tissue_gt = []  # ground truth tissue image class
-        tissue_types_inf = []  # string repr of ground truth tissue image class
-
-        paired_all_global = []  # unique matched index pair
-        unpaired_true_all_global = (
-            []
-        )  # the index must exist in `true_inst_type_all` and unique
-        unpaired_pred_all_global = (
-            []
-        )  # the index must exist in `pred_inst_type_all` and unique
-        true_inst_type_all_global = []  # each index is 1 independent data point
-        pred_inst_type_all_global = []  # each index is 1 independent data point
-
-        # for detections scores
-        true_idx_offset = 0
-        pred_idx_offset = 0
-
-        inference_loop = tqdm.tqdm(
-            enumerate(inference_dataloader), total=len(inference_dataloader)
-        )
-
-        with torch.no_grad():
-            for batch_idx, batch in inference_loop:
-                batch_metrics = self.inference_step(
-                    model, batch, generate_plots=generate_plots
-                )
-                # unpack batch_metrics
-                image_names = image_names + batch_metrics["image_names"]
-
-                # dice scores
-                binary_dice_scores = (
-                    binary_dice_scores + batch_metrics["binary_dice_scores"]
-                )
-                binary_jaccard_scores = (
-                    binary_jaccard_scores + batch_metrics["binary_jaccard_scores"]
-                )
-
-                # pq scores
-                pq_scores = pq_scores + batch_metrics["pq_scores"]
-                dq_scores = dq_scores + batch_metrics["dq_scores"]
-                sq_scores = sq_scores + batch_metrics["sq_scores"]
-                tissue_types_inf = tissue_types_inf + batch_metrics["tissue_types"]
-                cell_type_pq_scores = (
-                    cell_type_pq_scores + batch_metrics["cell_type_pq_scores"]
-                )
-                cell_type_dq_scores = (
-                    cell_type_dq_scores + batch_metrics["cell_type_dq_scores"]
-                )
-                cell_type_sq_scores = (
-                    cell_type_sq_scores + batch_metrics["cell_type_sq_scores"]
-                )
-                tissue_pred.append(batch_metrics["tissue_pred"])
-                tissue_gt.append(batch_metrics["tissue_gt"])
-
-                # detection scores
-                true_idx_offset = (
-                    true_idx_offset + true_inst_type_all_global[-1].shape[0]
-                    if batch_idx != 0
-                    else 0
-                )
-                pred_idx_offset = (
-                    pred_idx_offset + pred_inst_type_all_global[-1].shape[0]
-                    if batch_idx != 0
-                    else 0
-                )
-                true_inst_type_all_global.append(batch_metrics["true_inst_type_all"])
-                pred_inst_type_all_global.append(batch_metrics["pred_inst_type_all"])
-                # increment the pairing index statistic
-                batch_metrics["paired_all"][:, 0] += true_idx_offset
-                batch_metrics["paired_all"][:, 1] += pred_idx_offset
-                paired_all_global.append(batch_metrics["paired_all"])
-
-                batch_metrics["unpaired_true_all"] += true_idx_offset
-                batch_metrics["unpaired_pred_all"] += pred_idx_offset
-                unpaired_true_all_global.append(batch_metrics["unpaired_true_all"])
-                unpaired_pred_all_global.append(batch_metrics["unpaired_pred_all"])
-
-        # assemble batches to datasets (global)
-        tissue_types_inf = [t.lower() for t in tissue_types_inf]
-
-        paired_all = np.concatenate(paired_all_global, axis=0)
-        unpaired_true_all = np.concatenate(unpaired_true_all_global, axis=0)
-        unpaired_pred_all = np.concatenate(unpaired_pred_all_global, axis=0)
-        true_inst_type_all = np.concatenate(true_inst_type_all_global, axis=0)
-        pred_inst_type_all = np.concatenate(pred_inst_type_all_global, axis=0)
-        paired_true_type = true_inst_type_all[paired_all[:, 0]]
-        paired_pred_type = pred_inst_type_all[paired_all[:, 1]]
-        unpaired_true_type = true_inst_type_all[unpaired_true_all]
-        unpaired_pred_type = pred_inst_type_all[unpaired_pred_all]
-
-        binary_dice_scores = np.array(binary_dice_scores)
-        binary_jaccard_scores = np.array(binary_jaccard_scores)
-        pq_scores = np.array(pq_scores)
-        dq_scores = np.array(dq_scores)
-        sq_scores = np.array(sq_scores)
-
-        tissue_detection_accuracy = accuracy_score(
-            y_true=np.concatenate(tissue_gt), y_pred=np.concatenate(tissue_pred)
-        )
-        f1_d, prec_d, rec_d = cell_detection_scores(
-            paired_true=paired_true_type,
-            paired_pred=paired_pred_type,
-            unpaired_true=unpaired_true_type,
-            unpaired_pred=unpaired_pred_type,
-        )
-        dataset_metrics = {
-            "Binary-Cell-Dice-Mean": float(np.nanmean(binary_dice_scores)),
-            "Binary-Cell-Jacard-Mean": float(np.nanmean(binary_jaccard_scores)),
-            "Tissue-Multiclass-Accuracy": tissue_detection_accuracy,
-            "bPQ": float(np.nanmean(pq_scores)),
-            "bDQ": float(np.nanmean(dq_scores)),
-            "bSQ": float(np.nanmean(sq_scores)),
-            "mPQ": float(np.nanmean([np.nanmean(pq) for pq in cell_type_pq_scores])),
-            "mDQ": float(np.nanmean([np.nanmean(dq) for dq in cell_type_dq_scores])),
-            "mSQ": float(np.nanmean([np.nanmean(sq) for sq in cell_type_sq_scores])),
-            "f1_detection": float(f1_d),
-            "precision_detection": float(prec_d),
-            "recall_detection": float(rec_d),
-        }
-
-        # calculate tissue metrics
-        tissue_types = dataset_config["tissue_types"]
-        tissue_metrics = {}
-        for tissue in tissue_types.keys():
-            tissue = tissue.lower()
-            tissue_ids = np.where(np.asarray(tissue_types_inf) == tissue)
-            tissue_metrics[f"{tissue}"] = {}
-            tissue_metrics[f"{tissue}"]["Dice"] = float(
-                np.nanmean(binary_dice_scores[tissue_ids])
-            )
-            tissue_metrics[f"{tissue}"]["Jaccard"] = float(
-                np.nanmean(binary_jaccard_scores[tissue_ids])
-            )
-            tissue_metrics[f"{tissue}"]["mPQ"] = float(
-                np.nanmean(
-                    [np.nanmean(pq) for pq in np.array(cell_type_pq_scores)[tissue_ids]]
-                )
-            )
-            tissue_metrics[f"{tissue}"]["bPQ"] = float(
-                np.nanmean(pq_scores[tissue_ids])
-            )
-
-        # calculate nuclei metrics
-        nuclei_types = dataset_config["nuclei_types"]
-        nuclei_metrics_d = {}
-        nuclei_metrics_pq = {}
-        nuclei_metrics_dq = {}
-        nuclei_metrics_sq = {}
-        for nuc_name, nuc_type in nuclei_types.items():
-            if nuc_name.lower() == "background":
-                continue
-            nuclei_metrics_pq[nuc_name] = np.nanmean(
-                [pq[nuc_type] for pq in cell_type_pq_scores]
-            )
-            nuclei_metrics_dq[nuc_name] = np.nanmean(
-                [dq[nuc_type] for dq in cell_type_dq_scores]
-            )
-            nuclei_metrics_sq[nuc_name] = np.nanmean(
-                [sq[nuc_type] for sq in cell_type_sq_scores]
-            )
-            f1_cell, prec_cell, rec_cell = cell_type_detection_scores(
-                paired_true_type,
-                paired_pred_type,
-                unpaired_true_type,
-                unpaired_pred_type,
-                nuc_type,
-            )
-            nuclei_metrics_d[nuc_name] = {
-                "f1_cell": f1_cell,
-                "prec_cell": prec_cell,
-                "rec_cell": rec_cell,
-            }
-
-        # print final results
-        # binary
-        self.logger.info(f"{20*'*'} Binary Dataset metrics {20*'*'}")
-        [self.logger.info(f"{f'{k}:': <25} {v}") for k, v in dataset_metrics.items()]
-        # tissue -> the PQ values are bPQ values -> what about mBQ?
-        self.logger.info(f"{20*'*'} Tissue metrics {20*'*'}")
-        flattened_tissue = []
-        for key in tissue_metrics:
-            flattened_tissue.append(
-                [
-                    key,
-                    tissue_metrics[key]["Dice"],
-                    tissue_metrics[key]["Jaccard"],
-                    tissue_metrics[key]["mPQ"],
-                    tissue_metrics[key]["bPQ"],
-                ]
-            )
-        self.logger.info(
-            tabulate(
-                flattened_tissue, headers=["Tissue", "Dice", "Jaccard", "mPQ", "bPQ"]
-            )
-        )
-        # nuclei types
-        self.logger.info(f"{20*'*'} Nuclei Type Metrics {20*'*'}")
-        flattened_nuclei_type = []
-        for key in nuclei_metrics_pq:
-            flattened_nuclei_type.append(
-                [
-                    key,
-                    nuclei_metrics_dq[key],
-                    nuclei_metrics_sq[key],
-                    nuclei_metrics_pq[key],
-                ]
-            )
-        self.logger.info(
-            tabulate(flattened_nuclei_type, headers=["Nuclei Type", "DQ", "SQ", "PQ"])
-        )
-        # nuclei detection metrics
-        self.logger.info(f"{20*'*'} Nuclei Detection Metrics {20*'*'}")
-        flattened_detection = []
-        for key in nuclei_metrics_d:
-            flattened_detection.append(
-                [
-                    key,
-                    nuclei_metrics_d[key]["prec_cell"],
-                    nuclei_metrics_d[key]["rec_cell"],
-                    nuclei_metrics_d[key]["f1_cell"],
-                ]
-            )
-        self.logger.info(
-            tabulate(
-                flattened_detection,
-                headers=["Nuclei Type", "Precision", "Recall", "F1"],
-            )
-        )
-
-        # save all folds
-        image_metrics = {}
-        for idx, image_name in enumerate(image_names):
-            image_metrics[image_name] = {
-                "Dice": float(binary_dice_scores[idx]),
-                "Jaccard": float(binary_jaccard_scores[idx]),
-                "bPQ": float(pq_scores[idx]),
-            }
-        all_metrics = {
-            "dataset": dataset_metrics,
-            "tissue_metrics": tissue_metrics,
-            "image_metrics": image_metrics,
-            "nuclei_metrics_pq": nuclei_metrics_pq,
-            "nuclei_metrics_d": nuclei_metrics_d,
-        }
-
-        # saving
-        with open(str(self.run_dir / "inference_results.json"), "w") as outfile:
-            json.dump(all_metrics, outfile, indent=2)
-
-    def inference_step(
-        self,
-        model: Union[
-            CellViT,
-            CellViTShared,
-            CellViT256,
-            CellViT256Shared,
-            CellViTSAM,
-            CellViTSAMShared,
-        ],
-        batch: tuple,
-        generate_plots: bool = False,
-    ) -> None:
-        """Inference step for a patch-wise batch
-
-        Args:
-            model (CellViT): Model to use for inference
-            batch (tuple): Batch with the following structure:
-                * Images (torch.Tensor)
-                * Masks (dict)
-                * Tissue types as str
-                * Image name as str
-            generate_plots (bool, optional):  If inference plots should be generated. Defaults to False.
-        """
-        # unpack batch, for shape compare train_step method
-        imgs = batch[0].to(self.device)
-        masks = batch[1]
-        tissue_types = list(batch[2])
-        image_names = list(batch[3])
-
-        model.zero_grad()
-        if self.mixed_precision:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                predictions = model.forward(imgs)
-        else:
-            predictions = model.forward(imgs)
-        predictions = self.unpack_predictions(predictions=predictions, model=model)
-        gt = self.unpack_masks(masks=masks, tissue_types=tissue_types, model=model)
-
-        # scores
-        batch_metrics, scores = self.calculate_step_metric(predictions, gt, image_names)
-        batch_metrics["tissue_types"] = tissue_types
-        if generate_plots:
-            self.plot_results(
-                imgs=imgs,
-                predictions=predictions,
-                ground_truth=gt,
-                img_names=image_names,
-                num_nuclei_classes=self.num_classes,
-                outdir=Path(self.run_dir / "inference_predictions"),
-                scores=scores,
-            )
-
-        return batch_metrics
-
-    def unpack_predictions(
-        self, predictions: dict, model: CellViT
-    ) -> DataclassHVStorage:
-        """Unpack the given predictions. Main focus lays on reshaping and postprocessing predictions, e.g. separating instances
-
-        Args:
-            predictions (dict): Dictionary with the following keys:
-                * tissue_types: Logit tissue prediction output. Shape: (batch_size, num_tissue_classes)
-                * nuclei_binary_map: Logit output for binary nuclei prediction branch. Shape: (batch_size, H, W, 2)
-                * hv_map: Logit output for hv-prediction. Shape: (batch_size, H, W, 2)
-                * nuclei_type_map: Logit output for nuclei instance-prediction. Shape: (batch_size, num_nuclei_classes, H, W)
-            model (CellViT): Current model
+        Raises:
+            NotImplementedError: Not implemented sampler is selected
 
         Returns:
-            DataclassHVStorage: Processed network output
-
+            Sampler: Sampler for training
         """
-        predictions["tissue_types"] = predictions["tissue_types"].to(self.device)
-        predictions["nuclei_binary_map"] = F.softmax(
-            predictions["nuclei_binary_map"], dim=1
-        )  # shape: (batch_size, 2, H, W)
-        predictions["nuclei_type_map"] = F.softmax(
-            predictions["nuclei_type_map"], dim=1
-        )  # shape: (batch_size, num_nuclei_classes, H, W)
-        (
-            predictions["instance_map"],
-            predictions["instance_types"],
-        ) = model.calculate_instance_map(
-            predictions, magnification=self.magnification
-        )  # shape: (batch_size, H', W')
-        predictions["instance_types_nuclei"] = model.generate_instance_nuclei_map(
-            predictions["instance_map"], predictions["instance_types"]
-        ).to(
-            self.device
-        )  # shape: (batch_size, num_nuclei_classes, H, W)
-        predictions = DataclassHVStorage(
-            nuclei_binary_map=predictions["nuclei_binary_map"],
-            hv_map=predictions["hv_map"],
-            nuclei_type_map=predictions["nuclei_type_map"],
-            tissue_types=predictions["tissue_types"],
-            instance_map=predictions["instance_map"],
-            instance_types=predictions["instance_types"],
-            instance_types_nuclei=predictions["instance_types_nuclei"],
-            batch_size=predictions["tissue_types"].shape[0],
-        )
-
-        return predictions
-
-    def unpack_masks(
-        self, masks: dict, tissue_types: list, model: CellViT
-    ) -> DataclassHVStorage:
-        # get ground truth values, perform one hot encoding for segmentation maps
-        gt_nuclei_binary_map_onehot = (
-            F.one_hot(masks["nuclei_binary_map"], num_classes=2)
-        ).type(
-            torch.float32
-        )  # background, nuclei
-        nuclei_type_maps = torch.squeeze(masks["nuclei_type_map"]).type(torch.int64)
-        gt_nuclei_type_maps_onehot = F.one_hot(
-            nuclei_type_maps, num_classes=self.num_classes
-        ).type(
-            torch.float32
-        )  # background + nuclei types
-
-        # assemble ground truth dictionary
-        gt = {
-            "nuclei_type_map": gt_nuclei_type_maps_onehot.permute(0, 3, 1, 2).to(
-                self.device
-            ),  # shape: (batch_size, H, W, num_nuclei_classes)
-            "nuclei_binary_map": gt_nuclei_binary_map_onehot.permute(0, 3, 1, 2).to(
-                self.device
-            ),  # shape: (batch_size, H, W, 2)
-            "hv_map": masks["hv_map"].to(self.device),  # shape: (batch_size, H, W, 2)
-            "instance_map": masks["instance_map"].to(
-                self.device
-            ),  # shape: (batch_size, H, W) -> each instance has one integer
-            "instance_types_nuclei": (
-                gt_nuclei_type_maps_onehot * masks["instance_map"][..., None]
+        if strategy.lower() == "random":
+            sampling_generator = torch.Generator().manual_seed(
+                self.default_conf["random_seed"]
             )
-            .permute(0, 3, 1, 2)
-            .to(
-                self.device
-            ),  # shape: (batch_size, num_nuclei_classes, H, W) -> instance has one integer, for each nuclei class
-            "tissue_types": torch.Tensor(
-                [self.dataset_config["tissue_types"][t] for t in tissue_types]
+            sampler = RandomSampler(train_dataset, generator=sampling_generator)
+            self.logger.info("Using RandomSampler")
+        else:
+            # this solution is not accurate when a subset is used since the weights are calculated on the whole training dataset
+            if isinstance(train_dataset, Subset):
+                ds = train_dataset.dataset
+            else:
+                ds = train_dataset
+            ds.load_cell_count()
+            if strategy.lower() == "cell":
+                weights = ds.get_sampling_weights_cell(gamma)
+            elif strategy.lower() == "tissue":
+                weights = ds.get_sampling_weights_tissue(gamma)
+            elif strategy.lower() == "cell+tissue":
+                weights = ds.get_sampling_weights_cell_tissue(gamma)
+            else:
+                raise NotImplementedError(
+                    "Unknown sampling strategy - Implemented are cell, tissue and cell+tissue"
+                )
+
+            if isinstance(train_dataset, Subset):
+                weights = torch.Tensor([weights[i] for i in train_dataset.indices])
+
+            sampling_generator = torch.Generator().manual_seed(
+                self.default_conf["random_seed"]
             )
-            .type(torch.LongTensor)
-            .to(self.device),  # shape: batch_size
-        }
-        gt["instance_types"] = calculate_instances(
-            gt["nuclei_type_map"], gt["instance_map"]
-        )
-        gt = DataclassHVStorage(**gt, batch_size=gt["tissue_types"].shape[0])
-        return gt
+            sampler = WeightedRandomSampler(
+                weights=weights,
+                num_samples=len(train_dataset),
+                replacement=True,
+                generator=sampling_generator,
+            )
 
-    def calculate_step_metric(
-        self,
-        predictions: DataclassHVStorage,
-        gt: DataclassHVStorage,
-        image_names: list[str],
-    ) -> Tuple[dict, list]:
-        """Calculate the metrics for the validation step
+            self.logger.info(f"Using Weighted Sampling with strategy: {strategy}")
+            self.logger.info(f"Unique-Weights: {torch.unique(weights)}")
 
-        Args:
-            predictions (DataclassHVStorage): Processed network output
-            gt (DataclassHVStorage): Ground truth values
-            image_names (list(str)): List with image names
+        return sampler
+
+    def get_trainer(self) -> BaseTrainer:
+        """Return Trainer matching to this network
 
         Returns:
-            Tuple[dict, list]:
-                * dict: Dictionary with metrics. Structure not fixed yet
-                * list with cell_dice, cell_jaccard and pq for each image
+            BaseTrainer: Trainer
         """
-        predictions = predictions.get_dict()
-        gt = gt.get_dict()
-
-        # preparation and device movement
-        predictions["tissue_types_classes"] = F.softmax(
-            predictions["tissue_types"], dim=-1
-        )
-        pred_tissue = (
-            torch.argmax(predictions["tissue_types_classes"], dim=-1)
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(np.uint8)
-        )
-        predictions["instance_map"] = predictions["instance_map"].detach().cpu()
-        predictions["instance_types_nuclei"] = (
-            predictions["instance_types_nuclei"].detach().cpu().numpy().astype("int32")
-        )
-        instance_maps_gt = gt["instance_map"].detach().cpu()
-        gt["tissue_types"] = gt["tissue_types"].detach().cpu().numpy().astype(np.uint8)
-        gt["nuclei_binary_map"] = torch.argmax(gt["nuclei_binary_map"], dim=1).type(
-            torch.uint8
-        )
-        gt["instance_types_nuclei"] = (
-            gt["instance_types_nuclei"].detach().cpu().numpy().astype("int32")
-        )
-
-        # segmentation scores
-        binary_dice_scores = []  # binary dice scores per image
-        binary_jaccard_scores = []  # binary jaccard scores per image
-        pq_scores = []  # pq-scores per image
-        dq_scores = []  # dq-scores per image
-        sq_scores = []  # sq_scores per image
-        cell_type_pq_scores = []  # pq-scores per cell type and image
-        cell_type_dq_scores = []  # dq-scores per cell type and image
-        cell_type_sq_scores = []  # sq-scores per cell type and image
-        scores = []  # all scores in one list
-
-        # detection scores
-        paired_all = []  # unique matched index pair
-        unpaired_true_all = (
-            []
-        )  # the index must exist in `true_inst_type_all` and unique
-        unpaired_pred_all = (
-            []
-        )  # the index must exist in `pred_inst_type_all` and unique
-        true_inst_type_all = []  # each index is 1 independent data point
-        pred_inst_type_all = []  # each index is 1 independent data point
-
-        # for detections scores
-        true_idx_offset = 0
-        pred_idx_offset = 0
-
-        for i in range(len(pred_tissue)):
-            # binary dice score: Score for cell detection per image, without background
-            pred_binary_map = torch.argmax(predictions["nuclei_binary_map"][i], dim=0)
-            target_binary_map = gt["nuclei_binary_map"][i]
-            cell_dice = (
-                dice(preds=pred_binary_map, target=target_binary_map, ignore_index=0)
-                .detach()
-                .cpu()
-            )
-            binary_dice_scores.append(float(cell_dice))
-
-            # binary aji
-            cell_jaccard = (
-                binary_jaccard_index(
-                    preds=pred_binary_map,
-                    target=target_binary_map,
-                )
-                .detach()
-                .cpu()
-            )
-            binary_jaccard_scores.append(float(cell_jaccard))
-
-            # pq values
-            if len(np.unique(instance_maps_gt[i])) == 1:
-                dq, sq, pq = np.nan, np.nan, np.nan
-            else:
-                remapped_instance_pred = binarize(
-                    predictions["instance_types_nuclei"][i][1:].transpose(1, 2, 0)
-                )
-                remapped_gt = remap_label(instance_maps_gt[i])
-                [dq, sq, pq], _ = get_fast_pq(
-                    true=remapped_gt, pred=remapped_instance_pred
-                )
-            pq_scores.append(pq)
-            dq_scores.append(dq)
-            sq_scores.append(sq)
-            scores.append(
-                [
-                    cell_dice.detach().cpu().numpy(),
-                    cell_jaccard.detach().cpu().numpy(),
-                    pq,
-                ]
-            )
-
-            # pq values per class (with class 0 beeing background -> should be skipped in the future)
-            nuclei_type_pq = []
-            nuclei_type_dq = []
-            nuclei_type_sq = []
-            for j in range(0, self.num_classes):
-                pred_nuclei_instance_class = remap_label(
-                    predictions["instance_types_nuclei"][i][j, ...]
-                )
-                target_nuclei_instance_class = remap_label(
-                    gt["instance_types_nuclei"][i][j, ...]
-                )
-
-                # if ground truth is empty, skip from calculation
-                if len(np.unique(target_nuclei_instance_class)) == 1:
-                    pq_tmp = np.nan
-                    dq_tmp = np.nan
-                    sq_tmp = np.nan
-                else:
-                    [dq_tmp, sq_tmp, pq_tmp], _ = get_fast_pq(
-                        pred_nuclei_instance_class,
-                        target_nuclei_instance_class,
-                        match_iou=0.5,
-                    )
-                nuclei_type_pq.append(pq_tmp)
-                nuclei_type_dq.append(dq_tmp)
-                nuclei_type_sq.append(sq_tmp)
-
-            # detection scores
-            true_centroids = np.array(
-                [v["centroid"] for k, v in gt["instance_types"][i].items()]
-            )
-            true_instance_type = np.array(
-                [v["type"] for k, v in gt["instance_types"][i].items()]
-            )
-            pred_centroids = np.array(
-                [v["centroid"] for k, v in predictions["instance_types"][i].items()]
-            )
-            pred_instance_type = np.array(
-                [v["type"] for k, v in predictions["instance_types"][i].items()]
-            )
-
-            if true_centroids.shape[0] == 0:
-                true_centroids = np.array([[0, 0]])
-                true_instance_type = np.array([0])
-            if pred_centroids.shape[0] == 0:
-                pred_centroids = np.array([[0, 0]])
-                pred_instance_type = np.array([0])
-            if self.magnification == 40:
-                pairing_radius = 12
-            else:
-                pairing_radius = 6
-            paired, unpaired_true, unpaired_pred = pair_coordinates(
-                true_centroids, pred_centroids, pairing_radius
-            )
-            true_idx_offset = (
-                true_idx_offset + true_inst_type_all[-1].shape[0] if i != 0 else 0
-            )
-            pred_idx_offset = (
-                pred_idx_offset + pred_inst_type_all[-1].shape[0] if i != 0 else 0
-            )
-            true_inst_type_all.append(true_instance_type)
-            pred_inst_type_all.append(pred_instance_type)
-
-            # increment the pairing index statistic
-            if paired.shape[0] != 0:  # ! sanity
-                paired[:, 0] += true_idx_offset
-                paired[:, 1] += pred_idx_offset
-                paired_all.append(paired)
-
-            unpaired_true += true_idx_offset
-            unpaired_pred += pred_idx_offset
-            unpaired_true_all.append(unpaired_true)
-            unpaired_pred_all.append(unpaired_pred)
-
-            cell_type_pq_scores.append(nuclei_type_pq)
-            cell_type_dq_scores.append(nuclei_type_dq)
-            cell_type_sq_scores.append(nuclei_type_sq)
-
-        paired_all = np.concatenate(paired_all, axis=0)
-        unpaired_true_all = np.concatenate(unpaired_true_all, axis=0)
-        unpaired_pred_all = np.concatenate(unpaired_pred_all, axis=0)
-        true_inst_type_all = np.concatenate(true_inst_type_all, axis=0)
-        pred_inst_type_all = np.concatenate(pred_inst_type_all, axis=0)
-
-        batch_metrics = {
-            "image_names": image_names,
-            "binary_dice_scores": binary_dice_scores,
-            "binary_jaccard_scores": binary_jaccard_scores,
-            "pq_scores": pq_scores,
-            "dq_scores": dq_scores,
-            "sq_scores": sq_scores,
-            "cell_type_pq_scores": cell_type_pq_scores,
-            "cell_type_dq_scores": cell_type_dq_scores,
-            "cell_type_sq_scores": cell_type_sq_scores,
-            "tissue_pred": pred_tissue,
-            "tissue_gt": gt["tissue_types"],
-            "paired_all": paired_all,
-            "unpaired_true_all": unpaired_true_all,
-            "unpaired_pred_all": unpaired_pred_all,
-            "true_inst_type_all": true_inst_type_all,
-            "pred_inst_type_all": pred_inst_type_all,
-        }
-
-        return batch_metrics, scores
-
-    def plot_results(
-        self,
-        imgs: Union[torch.Tensor, np.ndarray],
-        predictions: dict,
-        ground_truth: dict,
-        img_names: List,
-        num_nuclei_classes: int,
-        outdir: Union[Path, str],
-        scores: List[List[float]] = None,
-    ) -> None:
-        # TODO: Adapt Docstring and function, currently not working with our shape
-        """Generate example plot with image, binary_pred, hv-map and instance map from prediction and ground-truth
-
-        Args:
-            imgs (Union[torch.Tensor, np.ndarray]): Images to process, a random number (num_images) is selected from this stack
-                Shape: (batch_size, 3, H', W')
-            predictions (dict): Predictions of models. Keys:
-                "nuclei_type_map": Shape: (batch_size, H', W', num_nuclei)
-                "nuclei_binary_map": Shape: (batch_size, H', W', 2)
-                "hv_map": Shape: (batch_size, H', W', 2)
-                "instance_map": Shape: (batch_size, H', W')
-            ground_truth (dict): Ground truth values. Keys:
-                "nuclei_type_map": Shape: (batch_size, H', W', num_nuclei)
-                "nuclei_binary_map": Shape: (batch_size, H', W', 2)
-                "hv_map": Shape: (batch_size, H', W', 2)
-                "instance_map": Shape: (batch_size, H', W')
-            img_names (List): Names of images as list
-            num_nuclei_classes (int): Number of total nuclei classes including background
-            outdir (Union[Path, str]): Output directory where images should be stored
-            scores (List[List[float]], optional): List with scores for each image.
-                Each list entry is a list with 3 scores: Dice, Jaccard and bPQ for the image.
-                Defaults to None.
-        """
-        outdir = Path(outdir)
-        outdir.mkdir(exist_ok=True, parents=True)
-
-        h = ground_truth["hv_map"].shape[1]
-        w = ground_truth["hv_map"].shape[2]
-
-        # convert to rgb and crop to selection
-        sample_images = (
-            imgs.permute(0, 2, 3, 1).contiguous().cpu().numpy()
-        )  # convert to rgb
-        sample_images = cropping_center(sample_images, (h, w), True)
-
-        pred_sample_binary_map = (
-            predictions["nuclei_binary_map"][:, :, :, 1].detach().cpu().numpy()
-        )
-        pred_sample_hv_map = predictions["hv_map"].detach().cpu().numpy()
-        pred_sample_instance_maps = predictions["instance_map"].detach().cpu().numpy()
-        pred_sample_type_maps = (
-            torch.argmax(predictions["nuclei_type_map"], dim=-1).detach().cpu().numpy()
-        )
-
-        # get ground truth labels
-        # gt_sample_binary_map = (
-        #     torch.argmax(ground_truth["nuclei_binary_map"], dim=-1).detach().cpu()
-        # )
-        gt_sample_binary_map = ground_truth["nuclei_binary_map"].detach().cpu().numpy()
-        gt_sample_hv_map = ground_truth["hv_map"].detach().cpu().numpy()
-        gt_sample_instance_map = ground_truth["instance_map"].detach().cpu().numpy()
-        gt_sample_type_map = (
-            torch.argmax(ground_truth["nuclei_type_map"], dim=-1).detach().cpu().numpy()
-        )
-
-        # create colormaps
-        hv_cmap = plt.get_cmap("jet")
-        binary_cmap = plt.get_cmap("jet")
-        instance_map = plt.get_cmap("viridis")
-        cell_colors = ["#ffffff", "#ff0000", "#00ff00", "#1e00ff", "#feff00", "#ffbf00"]
-
-        # invert the normalization of the sample images
-        transform_settings = self.run_conf["transformations"]
-        if "normalize" in transform_settings:
-            mean = transform_settings["normalize"].get("mean", (0.5, 0.5, 0.5))
-            std = transform_settings["normalize"].get("std", (0.5, 0.5, 0.5))
-        else:
-            mean = (0.5, 0.5, 0.5)
-            std = (0.5, 0.5, 0.5)
-        inv_normalize = transforms.Normalize(
-            mean=[-0.5 / mean[0], -0.5 / mean[1], -0.5 / mean[2]],
-            std=[1 / std[0], 1 / std[1], 1 / std[2]],
-        )
-        inv_samples = inv_normalize(torch.tensor(sample_images).permute(0, 3, 1, 2))
-        sample_images = inv_samples.permute(0, 2, 3, 1).detach().cpu().numpy()
-
-        for i in range(len(img_names)):
-            fig, axs = plt.subplots(figsize=(6, 2), dpi=300)
-            placeholder = np.zeros((2 * h, 7 * w, 3))
-            # orig image
-            placeholder[:h, :w, :3] = sample_images[i]
-            placeholder[h : 2 * h, :w, :3] = sample_images[i]
-            # binary prediction
-            placeholder[:h, w : 2 * w, :3] = rgba2rgb(
-                binary_cmap(gt_sample_binary_map[i] * 255)
-            )
-            placeholder[h : 2 * h, w : 2 * w, :3] = rgba2rgb(
-                binary_cmap(pred_sample_binary_map[i])
-            )  # *255?
-            # hv maps
-            placeholder[:h, 2 * w : 3 * w, :3] = rgba2rgb(
-                hv_cmap((gt_sample_hv_map[i, :, :, 0] + 1) / 2)
-            )
-            placeholder[h : 2 * h, 2 * w : 3 * w, :3] = rgba2rgb(
-                hv_cmap((pred_sample_hv_map[i, :, :, 0] + 1) / 2)
-            )
-            placeholder[:h, 3 * w : 4 * w, :3] = rgba2rgb(
-                hv_cmap((gt_sample_hv_map[i, :, :, 1] + 1) / 2)
-            )
-            placeholder[h : 2 * h, 3 * w : 4 * w, :3] = rgba2rgb(
-                hv_cmap((pred_sample_hv_map[i, :, :, 1] + 1) / 2)
-            )
-            # instance_predictions
-            placeholder[:h, 4 * w : 5 * w, :3] = rgba2rgb(
-                instance_map(
-                    (gt_sample_instance_map[i] - np.min(gt_sample_instance_map[i]))
-                    / (
-                        np.max(gt_sample_instance_map[i])
-                        - np.min(gt_sample_instance_map[i] + 1e-10)
-                    )
-                )
-            )
-            placeholder[h : 2 * h, 4 * w : 5 * w, :3] = rgba2rgb(
-                instance_map(
-                    (
-                        pred_sample_instance_maps[i]
-                        - np.min(pred_sample_instance_maps[i])
-                    )
-                    / (
-                        np.max(pred_sample_instance_maps[i])
-                        - np.min(pred_sample_instance_maps[i] + 1e-10)
-                    )
-                )
-            )
-            # type_predictions
-            placeholder[:h, 5 * w : 6 * w, :3] = rgba2rgb(
-                binary_cmap(gt_sample_type_map[i] / num_nuclei_classes)
-            )
-            placeholder[h : 2 * h, 5 * w : 6 * w, :3] = rgba2rgb(
-                binary_cmap(pred_sample_type_maps[i] / num_nuclei_classes)
-            )
-
-            # contours
-            # gt
-            gt_contours_polygon = [
-                v["contour"] for v in ground_truth["instance_types"][i].values()
-            ]
-            gt_contours_polygon = [
-                list(zip(poly[:, 0], poly[:, 1])) for poly in gt_contours_polygon
-            ]
-            gt_contour_colors_polygon = [
-                cell_colors[v["type"]]
-                for v in ground_truth["instance_types"][i].values()
-            ]
-            gt_cell_image = Image.fromarray(
-                (sample_images[i] * 255).astype(np.uint8)
-            ).convert("RGB")
-            gt_drawing = ImageDraw.Draw(gt_cell_image)
-            add_patch = lambda poly, color: gt_drawing.polygon(
-                poly, outline=color, width=2
-            )
-            [
-                add_patch(poly, c)
-                for poly, c in zip(gt_contours_polygon, gt_contour_colors_polygon)
-            ]
-            gt_cell_image.save(outdir / f"raw_gt_{img_names[i]}")
-            placeholder[:h, 6 * w : 7 * w, :3] = np.asarray(gt_cell_image) / 255
-            # pred
-            pred_contours_polygon = [
-                v["contour"] for v in predictions["instance_types"][i].values()
-            ]
-            pred_contours_polygon = [
-                list(zip(poly[:, 0], poly[:, 1])) for poly in pred_contours_polygon
-            ]
-            pred_contour_colors_polygon = [
-                cell_colors[v["type"]]
-                for v in predictions["instance_types"][i].values()
-            ]
-            pred_cell_image = Image.fromarray(
-                (sample_images[i] * 255).astype(np.uint8)
-            ).convert("RGB")
-            pred_drawing = ImageDraw.Draw(pred_cell_image)
-            add_patch = lambda poly, color: pred_drawing.polygon(
-                poly, outline=color, width=2
-            )
-            [
-                add_patch(poly, c)
-                for poly, c in zip(pred_contours_polygon, pred_contour_colors_polygon)
-            ]
-            pred_cell_image.save(outdir / f"raw_pred_{img_names[i]}")
-            placeholder[h : 2 * h, 6 * w : 7 * w, :3] = (
-                np.asarray(pred_cell_image) / 255
-            )
-
-            # plotting
-            axs.imshow(placeholder)
-            axs.set_xticks(np.arange(w / 2, 7 * w, w))
-            axs.set_xticklabels(
-                [
-                    "Image",
-                    "Binary-Cells",
-                    "HV-Map-0",
-                    "HV-Map-1",
-                    "Instances",
-                    "Nuclei-Pred",
-                    "Countours",
-                ],
-                fontsize=6,
-            )
-            axs.xaxis.tick_top()
-
-            axs.set_yticks(np.arange(h / 2, 2 * h, h))
-            axs.set_yticklabels(["GT", "Pred."], fontsize=6)
-            axs.tick_params(axis="both", which="both", length=0)
-            grid_x = np.arange(w, 6 * w, w)
-            grid_y = np.arange(h, 2 * h, h)
-
-            for x_seg in grid_x:
-                axs.axvline(x_seg, color="black")
-            for y_seg in grid_y:
-                axs.axhline(y_seg, color="black")
-
-            if scores is not None:
-                axs.text(
-                    20,
-                    1.85 * h,
-                    f"Dice: {str(np.round(scores[i][0], 2))}\nJac.: {str(np.round(scores[i][1], 2))}\nbPQ: {str(np.round(scores[i][2], 2))}",
-                    bbox={"facecolor": "white", "pad": 2, "alpha": 0.5},
-                    fontsize=4,
-                )
-            fig.suptitle(f"Patch Predictions for {img_names[i]}")
-            fig.tight_layout()
-            fig.savefig(outdir / f"pred_{img_names[i]}")
-            plt.close()
-
-
-# CLI
-class InferenceCellViTParser:
-    def __init__(self) -> None:
-        parser = argparse.ArgumentParser(
-            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-            description="Perform CellViT inference for given run-directory with model checkpoints and logs",
-        )
-
-        parser.add_argument(
-            "--run_dir",
-            type=str,
-            help="Logging directory of a training run.",
-            required=True,
-        )
-        parser.add_argument(
-            "--checkpoint_name",
-            type=str,
-            help="Name of the checkpoint.  Either select 'best_checkpoint.pth',"
-            "'latest_checkpoint.pth' or one of the intermediate checkpoint names,"
-            "e.g., 'checkpoint_100.pth'",
-            default="model_best.pth",
-        )
-        parser.add_argument(
-            "--gpu", type=int, help="Cuda-GPU ID for inference", default=5
-        )
-        parser.add_argument(
-            "--magnification",
-            type=int,
-            help="Dataset Magnification. Either 20 or 40. Default: 40",
-            choices=[20, 40],
-            default=40,
-        )
-        parser.add_argument(
-            "--plots",
-            action="store_true",
-            help="Generate inference plots in run_dir",
-        )
-
-        self.parser = parser
-
-    def parse_arguments(self) -> dict:
-        opt = self.parser.parse_args()
-        return vars(opt)
-
-
-if __name__ == "__main__":
-    configuration_parser = InferenceCellViTParser()
-    configuration = configuration_parser.parse_arguments()
-    print(configuration)
-    inf = InferenceCellViT(
-        run_dir=configuration["run_dir"],
-        checkpoint_name=configuration["checkpoint_name"],
-        gpu=configuration["gpu"],
-        magnification=configuration["magnification"],
-    )
-    model, dataloader, conf = inf.setup_patch_inference()
-
-    inf.run_patch_inference(
-        model, dataloader, conf, generate_plots=configuration["plots"]
-    )
+        return CellViTTrainer

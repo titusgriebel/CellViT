@@ -71,8 +71,7 @@ class InferenceCellViT:
     def __init__(
         self,
         run_dir: Union[Path, str],
-        dataset_path: str,
-        gpu = 0,
+        gpu: int,
         magnification: int = 40,
         checkpoint_name: str = "model_best.pth",
     ) -> None:
@@ -90,13 +89,41 @@ class InferenceCellViT:
         self.logger: Logger = None
         self.magnification = magnification
         self.checkpoint_name = checkpoint_name
-        self.dataset_path = dataset_path
 
+        self.__load_run_conf()
+
+        self.__load_dataset_setup(dataset_path=self.run_conf["data"]["dataset_path"])
         self.__instantiate_logger()
         self.__check_eval_model()
         self.__setup_amp()
 
         self.logger.info(f"Loaded run: {run_dir}")
+        self.num_classes = self.run_conf["data"]["num_nuclei_classes"]
+
+    def __load_run_conf(self) -> None:
+        """Load the config.yaml file with the run setup
+
+        Be careful with loading and usage, since original None values in the run configuration are not stored when dumped to yaml file.
+        If you want to check if a key is not defined, first check if the key does exists in the dict.
+        """
+        with open((self.run_dir / "config.yaml").resolve(), "r") as run_config_file:
+            yaml_config = yaml.safe_load(run_config_file)
+            self.run_conf = dict(yaml_config)
+
+    def __load_dataset_setup(self, dataset_path: Union[Path, str]) -> None:
+        """Load the configuration of the cell segmentation dataset.
+
+        The dataset must have a dataset_config.yaml file in their dataset path with the following entries:
+            * tissue_types: describing the present tissue types with corresponding integer
+            * nuclei_types: describing the present nuclei types with corresponding integer
+
+        Args:
+            dataset_path (Union[Path, str]): Path to dataset folder
+        """
+        dataset_config_path = Path(dataset_path) / "dataset_config.yaml"
+        with open(dataset_config_path, "r") as dataset_config_file:
+            yaml_config = yaml.safe_load(dataset_config_file)
+            self.dataset_config = dict(yaml_config)
 
     def __instantiate_logger(self) -> None:
         """Instantiate logger

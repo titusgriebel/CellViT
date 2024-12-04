@@ -450,9 +450,13 @@ class MoNuSegInference:
             .cpu()
         )
         remapped_instance_pred = (remap_label(predictions["instance_map"])) ## TODO inference masks to extract --> done
+        
         prediction_mask = np.squeeze(remapped_instance_pred)
+        if prediction_mask.dtype != np.int32:
+            prediction_mask = prediction_mask.cpu().numpy().astype(np.int32)
         output_path = os.path.join(self.label_dir, image_name)
         print('Mask shape and datatype: ', prediction_mask.shape, prediction_mask.dtype)
+
         tiff.imwrite(output_path, prediction_mask)
         remapped_gt = remap_label(instance_maps_gt)
         [dq, sq, pq], _ = get_fast_pq(true=remapped_gt, pred=remapped_instance_pred)
