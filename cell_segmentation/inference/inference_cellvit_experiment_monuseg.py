@@ -374,7 +374,7 @@ class MoNuSegInference:
                 img = torch.unsqueeze(img, dim=0)
                 img = torch.permute(img, (0, 3, 1, 2))
             elif self.overlap != 0 and self.patching:
-                h, w = mask['nuclei_binary_map'].shape[1:]
+                h, w = mask["nuclei_binary_map"].shape[1:]
                 total_img = torch.zeros((3, h, w))
                 decomposed_patch_num = int(np.sqrt(img.shape[0]))
                 for i in range(decomposed_patch_num):
@@ -382,7 +382,7 @@ class MoNuSegInference:
                         x_global = i * 256 - i * self.overlap
                         y_global = j * 256 - j * self.overlap
                         total_img[
-                            :, x_global : x_global + 256, y_global : y_global + 256
+                            :, x_global: x_global + 256, y_global: y_global + 256
                         ] = img[i * decomposed_patch_num + j]
                 img = total_img
                 img = img[None, :, :, :]
@@ -390,7 +390,7 @@ class MoNuSegInference:
                 img=img,
                 predictions=predictions,
                 ground_truth=mask,
-                img_name=image_name,  # removed indexing, which does not work and is not necessary for our image names
+                img_name=image_name,
                 outdir=self.outdir,
                 scores=scores,
             )
@@ -449,8 +449,7 @@ class MoNuSegInference:
             .detach()
             .cpu()
         )
-        remapped_instance_pred = (remap_label(predictions["instance_map"])) ## TODO inference masks to extract --> done
-        
+        remapped_instance_pred = (remap_label(predictions["instance_map"]))
         prediction_mask = np.squeeze(remapped_instance_pred)
         if prediction_mask.dtype != np.int32:
             prediction_mask = prediction_mask.cpu().numpy().astype(np.int32)
