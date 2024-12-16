@@ -84,6 +84,7 @@ class CellViTTrainer(BaseTrainer):
         log_images: bool = False,
         magnification: int = 40,
         mixed_precision: bool = False,
+        
     ):
         super().__init__(
             model=model,
@@ -100,11 +101,7 @@ class CellViTTrainer(BaseTrainer):
             mixed_precision=mixed_precision,
         )
         self.loss_fn_dict = loss_fn_dict
-        self.num_classes = num_classes
         self.dataset_config = dataset_config
-        self.tissue_types = dataset_config["tissue_types"]
-        self.reverse_tissue_types = {v: k for k, v in self.tissue_types.items()}
-        self.nuclei_types = dataset_config["nuclei_types"]
         self.magnification = magnification
 
         # setup logging objects
@@ -136,8 +133,6 @@ class CellViTTrainer(BaseTrainer):
 
         binary_dice_scores = []
         binary_jaccard_scores = []
-        tissue_pred = []
-        tissue_gt = []
         train_example_img = None
 
         # reset metrics
@@ -170,8 +165,6 @@ class CellViTTrainer(BaseTrainer):
             binary_jaccard_scores = (
                 binary_jaccard_scores + batch_metrics["binary_jaccard_scores"]
             )
-            tissue_pred.append(batch_metrics["tissue_pred"])
-            tissue_gt.append(batch_metrics["tissue_gt"])
             train_loop.set_postfix(
                 {
                     "Loss": np.round(self.loss_avg_tracker["Total_Loss"].avg, 3),
@@ -183,15 +176,11 @@ class CellViTTrainer(BaseTrainer):
         # calculate global metrics
         binary_dice_scores = np.array(binary_dice_scores)
         binary_jaccard_scores = np.array(binary_jaccard_scores)
-        tissue_detection_accuracy = accuracy_score(
-            y_true=np.concatenate(tissue_gt), y_pred=np.concatenate(tissue_pred)
-        )
 
         scalar_metrics = {
             "Loss/Train": self.loss_avg_tracker["Total_Loss"].avg,
             "Binary-Cell-Dice-Mean/Train": np.nanmean(binary_dice_scores),
             "Binary-Cell-Jacard-Mean/Train": np.nanmean(binary_jaccard_scores),
-            "Tissue-Multiclass-Accuracy/Train": tissue_detection_accuracy,
         }
 
         for branch, loss_fns in self.loss_fn_dict.items():
@@ -205,7 +194,6 @@ class CellViTTrainer(BaseTrainer):
             f"Loss: {self.loss_avg_tracker['Total_Loss'].avg:.4f} - "
             f"Binary-Cell-Dice: {np.nanmean(binary_dice_scores):.4f} - "
             f"Binary-Cell-Jacard: {np.nanmean(binary_jaccard_scores):.4f} - "
-            f"Tissue-MC-Acc.: {tissue_detection_accuracy:.4f}"
         )
 
         image_metrics = {"Example-Predictions/Train": train_example_img}
@@ -237,7 +225,6 @@ class CellViTTrainer(BaseTrainer):
         masks = batch[
             1
         ]  # dict: keys: "instance_map", "nuclei_map", "nuclei_binary_map", "hv_map"
-        tissue_types = batch[2]  # list[str]
 
         if self.mixed_precision:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -246,7 +233,7 @@ class CellViTTrainer(BaseTrainer):
 
                 # reshaping and postprocessing
                 predictions = self.unpack_predictions(predictions=predictions_)
-                gt = self.unpack_masks(masks=masks, tissue_types=tissue_types)
+                gt = self.unpack_masks(masks=masks)
 
                 # calculate loss
                 total_loss = self.calculate_loss(predictions, gt)
@@ -266,7 +253,7 @@ class CellViTTrainer(BaseTrainer):
         else:
             predictions_ = self.model.forward(imgs)
             predictions = self.unpack_predictions(predictions=predictions_)
-            gt = self.unpack_masks(masks=masks, tissue_types=tissue_types)
+            gt = self.unpack_masks(masks=masks)
 
             # calculate loss
             total_loss = self.calculate_loss(predictions, gt)
@@ -287,7 +274,7 @@ class CellViTTrainer(BaseTrainer):
 
         if return_example_images:
             return_example_images = self.generate_example_image(
-                imgs, predictions, gt, num_images=4, num_nuclei_classes=self.num_classes
+                imgs, predictions, gt, num_images=4
             )
         else:
             return_example_images = None
@@ -361,9 +348,7 @@ class CellViTTrainer(BaseTrainer):
                         "Pred-Acc": np.round(self.batch_avg_tissue_acc.avg, 3),
                     }
                 )
-        tissue_types_val = [
-            self.reverse_tissue_types[t].lower() for t in np.concatenate(tissue_gt)
-        ]
+
 
         # calculate global metrics
         binary_dice_scores = np.array(binary_dice_scores)
@@ -390,31 +375,6 @@ class CellViTTrainer(BaseTrainer):
                     f"{branch}_{loss_name}/Validation"
                 ] = self.loss_avg_tracker[f"{branch}_{loss_name}"].avg
 
-        # calculate local metrics
-        # per tissue class
-        for tissue in self.tissue_types.keys():
-            tissue = tissue.lower()
-            tissue_ids = np.where(np.asarray(tissue_types_val) == tissue)
-            scalar_metrics[f"{tissue}-Dice/Validation"] = np.nanmean(
-                binary_dice_scores[tissue_ids]
-            )
-            scalar_metrics[f"{tissue}-Jaccard/Validation"] = np.nanmean(
-                binary_jaccard_scores[tissue_ids]
-            )
-            scalar_metrics[f"{tissue}-bPQ/Validation"] = np.nanmean(
-                pq_scores[tissue_ids]
-            )
-            scalar_metrics[f"{tissue}-mPQ/Validation"] = np.nanmean(
-                [np.nanmean(pq) for pq in np.array(cell_type_pq_scores)[tissue_ids]]
-            )
-
-        # calculate nuclei metrics
-        for nuc_name, nuc_type in self.nuclei_types.items():
-            if nuc_name.lower() == "background":
-                continue
-            scalar_metrics[f"{nuc_name}-PQ/Validation"] = np.nanmean(
-                [pq[nuc_type] for pq in cell_type_pq_scores]
-            )
 
         self.logger.info(
             f"{'Validation epoch stats:' : <25} "
@@ -451,7 +411,6 @@ class CellViTTrainer(BaseTrainer):
         # unpack batch, for shape compare train_step method
         imgs = batch[0].to(self.device)
         masks = batch[1]
-        tissue_types = batch[2]
 
         self.model.zero_grad()
         self.optimizer.zero_grad()
@@ -461,7 +420,7 @@ class CellViTTrainer(BaseTrainer):
                 predictions_ = self.model.forward(imgs)
                 # reshaping and postprocessing
                 predictions = self.unpack_predictions(predictions=predictions_)
-                gt = self.unpack_masks(masks=masks, tissue_types=tissue_types)
+                gt = self.unpack_masks(masks=masks)
                 # calculate loss
                 _ = self.calculate_loss(predictions, gt)
 
@@ -469,7 +428,7 @@ class CellViTTrainer(BaseTrainer):
             predictions_ = self.model.forward(imgs)
             # reshaping and postprocessing
             predictions = self.unpack_predictions(predictions=predictions_)
-            gt = self.unpack_masks(masks=masks, tissue_types=tissue_types)
+            gt = self.unpack_masks(masks=masks)
             # calculate loss
             _ = self.calculate_loss(predictions, gt)
 
@@ -483,7 +442,6 @@ class CellViTTrainer(BaseTrainer):
                     predictions,
                     gt,
                     num_images=4,
-                    num_nuclei_classes=self.num_classes,
                 )
             except AssertionError:
                 self.logger.error(
@@ -508,16 +466,11 @@ class CellViTTrainer(BaseTrainer):
         Returns:
             DataclassHVStorage: Processed network output
         """
-        predictions["tissue_types"] = predictions["tissue_types"].to(self.device)
         predictions["nuclei_binary_map"] = F.softmax(
             predictions["nuclei_binary_map"], dim=1
         )  # shape: (batch_size, 2, H, W)
-        predictions["nuclei_type_map"] = F.softmax(
-            predictions["nuclei_type_map"], dim=1
-        )  # shape: (batch_size, num_nuclei_classes, H, W)
         (
             predictions["instance_map"],
-            predictions["instance_types"],
         ) = self.model.calculate_instance_map(
             predictions, self.magnification
         )  # shape: (batch_size, H, W)
@@ -533,8 +486,6 @@ class CellViTTrainer(BaseTrainer):
         predictions = DataclassHVStorage(
             nuclei_binary_map=predictions["nuclei_binary_map"],
             hv_map=predictions["hv_map"],
-            nuclei_type_map=predictions["nuclei_type_map"],
-            tissue_types=predictions["tissue_types"],
             instance_map=predictions["instance_map"],
             instance_types=predictions["instance_types"],
             instance_types_nuclei=predictions["instance_types_nuclei"],
@@ -545,7 +496,7 @@ class CellViTTrainer(BaseTrainer):
 
         return predictions
 
-    def unpack_masks(self, masks: dict, tissue_types: list) -> DataclassHVStorage:
+    def unpack_masks(self, masks: dict) -> DataclassHVStorage:
         """Unpack the given masks. Main focus lays on reshaping and postprocessing masks to generate one dict
 
         Args:
@@ -567,18 +518,9 @@ class CellViTTrainer(BaseTrainer):
         ).type(
             torch.float32
         )  # background, nuclei
-        nuclei_type_maps = torch.squeeze(masks["nuclei_type_map"]).type(torch.int64)
-        gt_nuclei_type_maps_onehot = F.one_hot(
-            nuclei_type_maps, num_classes=self.num_classes
-        ).type(
-            torch.float32
-        )  # background + nuclei types
 
         # assemble ground truth dictionary
         gt = {
-            "nuclei_type_map": gt_nuclei_type_maps_onehot.permute(0, 3, 1, 2).to(
-                self.device
-            ),  # shape: (batch_size, H, W, num_nuclei_classes)
             "nuclei_binary_map": gt_nuclei_binary_map_onehot.permute(0, 3, 1, 2).to(
                 self.device
             ),  # shape: (batch_size, H, W, 2)
@@ -586,24 +528,15 @@ class CellViTTrainer(BaseTrainer):
             "instance_map": masks["instance_map"].to(
                 self.device
             ),  # shape: (batch_size, H, W) -> each instance has one integer
-            "instance_types_nuclei": (
-                gt_nuclei_type_maps_onehot * masks["instance_map"][..., None]
-            )
-            .permute(0, 3, 1, 2)
-            .to(
-                self.device
-            ),  # shape: (batch_size, num_nuclei_classes, H, W) -> instance has one integer, for each nuclei class
-            "tissue_types": torch.Tensor([self.tissue_types[t] for t in tissue_types])
-            .type(torch.LongTensor)
-            .to(self.device),  # shape: batch_size
+                # shape: (batch_size, num_nuclei_classes, H, W) -> instance has one integer, for each nuclei class
         }
         if "regression_map" in masks:
             gt["regression_map"] = masks["regression_map"].to(self.device)
 
         gt = DataclassHVStorage(
             **gt,
-            batch_size=gt["tissue_types"].shape[0],
-            num_nuclei_classes=self.num_classes,
+            batch_size=gt["instance_map"].shape[0],
+            num_nuclei_classes=2,
         )
         return gt
 

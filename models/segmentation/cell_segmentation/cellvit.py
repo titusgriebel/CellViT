@@ -137,7 +137,6 @@ class CellViT(nn.Module):
         self.branches_output = {
             "nuclei_binary_map": 2 + offset_branches,
             "hv_map": 2,
-            "nuclei_type_maps": self.num_nuclei_classes,
         }
 
         self.nuclei_binary_map_decoder = self.create_upsampling_branch(
@@ -146,9 +145,7 @@ class CellViT(nn.Module):
         self.hv_map_decoder = self.create_upsampling_branch(
             2
         )  # todo: adapt for helper loss
-        self.nuclei_type_maps_decoder = self.create_upsampling_branch(
-            self.num_nuclei_classes
-        )
+
 
     def forward(self, x: torch.Tensor, retrieve_tokens: bool = False) -> dict:
         """Forward pass
@@ -177,7 +174,6 @@ class CellViT(nn.Module):
         out_dict = {}
 
         classifier_logits, _, z = self.encoder(x)
-        out_dict["tissue_types"] = classifier_logits
 
         z0, z1, z2, z3, z4 = x, *z
 
@@ -201,9 +197,7 @@ class CellViT(nn.Module):
         out_dict["hv_map"] = self._forward_upsample(
             z0, z1, z2, z3, z4, self.hv_map_decoder
         )
-        out_dict["nuclei_type_map"] = self._forward_upsample(
-            z0, z1, z2, z3, z4, self.nuclei_type_maps_decoder
-        )
+
         if retrieve_tokens:
             out_dict["tokens"] = z4
 
@@ -349,26 +343,20 @@ class CellViT(nn.Module):
         """
         # reshape to B, H, W, C
         predictions_ = predictions.copy()
-        predictions_["nuclei_type_map"] = predictions_["nuclei_type_map"].permute(
-            0, 2, 3, 1
-        )
+      
         predictions_["nuclei_binary_map"] = predictions_["nuclei_binary_map"].permute(
             0, 2, 3, 1
         )
         predictions_["hv_map"] = predictions_["hv_map"].permute(0, 2, 3, 1)
 
         cell_post_processor = DetectionCellPostProcessor(
-            nr_types=self.num_nuclei_classes, magnification=magnification, gt=False
+            magnification=magnification, gt=False
         )
         instance_preds = []
-        type_preds = []
 
         for i in range(predictions_["nuclei_binary_map"].shape[0]):
             pred_map = np.concatenate(
                 [
-                    torch.argmax(predictions_["nuclei_type_map"], dim=-1)[i]
-                    .detach()
-                    .cpu()[..., None],
                     torch.argmax(predictions_["nuclei_binary_map"], dim=-1)[i]
                     .detach()
                     .cpu()[..., None],
@@ -378,40 +366,13 @@ class CellViT(nn.Module):
             )
             instance_pred = cell_post_processor.post_process_cell_segmentation(pred_map)
             instance_preds.append(instance_pred[0])
-            type_preds.append(instance_pred[1])
 
-        return torch.Tensor(np.stack(instance_preds)), type_preds
+        return torch.Tensor(np.stack(instance_preds))
 
-    def generate_instance_nuclei_map(
-        self, instance_maps: torch.Tensor, type_preds: List[dict]
-    ) -> torch.Tensor:
-        """Convert instance map (binary) to nuclei type instance map
-
-        Args:
-            instance_maps (torch.Tensor): Binary instance map, each instance has own integer. Shape: (B, H, W)
-            type_preds (List[dict]): List (len=B) of dictionary with instance type information (compare post_process_hovernet function for more details)
-
-        Returns:
-            torch.Tensor: Nuclei type instance map. Shape: (B, self.num_nuclei_classes, H, W)
-        """
-        batch_size, h, w = instance_maps.shape
-        instance_type_nuclei_maps = torch.zeros(
-            (batch_size, h, w, self.num_nuclei_classes)
-        )
-        for i in range(batch_size):
-            instance_type_nuclei_map = torch.zeros((h, w, self.num_nuclei_classes))
-            instance_map = instance_maps[i]
-            type_pred = type_preds[i]
-            for nuclei, spec in type_pred.items():
-                nuclei_type = spec["type"]
-                instance_type_nuclei_map[:, :, nuclei_type][
-                    instance_map == nuclei
-                ] = nuclei
-
-            instance_type_nuclei_maps[i, :, :, :] = instance_type_nuclei_map
-
-        instance_type_nuclei_maps = instance_type_nuclei_maps.permute(0, 3, 1, 2)
-        return torch.Tensor(instance_type_nuclei_maps)
+    # def generate_instance_nuclei_map(
+    #     self, instance_maps: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     """Convert instance map (binary) to nuclei type instance map
 
     def freeze_encoder(self):
         """Freeze encoder to not train it"""
@@ -610,7 +571,6 @@ class CellViTSAM(CellViT):
         out_dict = {}
 
         classifier_logits, _, z = self.encoder(x)
-        out_dict["tissue_types"] = self.classifier_head(classifier_logits)
 
         z0, z1, z2, z3, z4 = x, *z
 
@@ -633,9 +593,6 @@ class CellViTSAM(CellViT):
 
         out_dict["hv_map"] = self._forward_upsample(
             z0, z1, z2, z3, z4, self.hv_map_decoder
-        )
-        out_dict["nuclei_type_map"] = self._forward_upsample(
-            z0, z1, z2, z3, z4, self.nuclei_type_maps_decoder
         )
 
         if retrieve_tokens:
@@ -697,12 +654,8 @@ class DataclassHVStorage:
 
     nuclei_binary_map: torch.Tensor
     hv_map: torch.Tensor
-    tissue_types: torch.Tensor
-    nuclei_type_map: torch.Tensor
     instance_map: torch.Tensor
-    instance_types_nuclei: torch.Tensor
     batch_size: int
-    instance_types: list = None
     regression_map: torch.Tensor = None
     regression_loss: bool = False
     h: int = 256
