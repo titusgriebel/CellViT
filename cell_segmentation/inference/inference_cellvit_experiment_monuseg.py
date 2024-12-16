@@ -97,30 +97,32 @@ class MoNuSegInference:
         self.model_path = Path(model_path)
         self.device = f"cuda:{gpu}"
         self.outdir = Path(outdir)
-        self.label_dir = os.path.join(outdir, dataset_name, 'inference_masks')
+        self.prediction_dir = os.path.join(outdir, 'predictions')
+        self.label_dir = os.path.join(outdir, 'labels')
+        self.raw_dir = os.path.join(outdir, 'images')
         self.outdir.mkdir(exist_ok=True, parents=True)
         self.magnification = magnification
         self.overlap = overlap
         self.patching = patching
-        self.outdir = os.path.join(outdir, dataset_name)
         if overlap > 0:
             assert patching, "Patching must be activated"
         self.__instantiate_logger() 
         self.__load_model()
         self.__load_inference_transforms()
         self.__setup_amp()
-        
         raw_transform = sam_training.identity
         sampler = MinInstanceSampler(min_num_instances=3)
         self.inference_dataloader = get_loader(
             path=data_path,
             dataset_name=dataset_name,
-            patch_shape=(1, 512, 512),
+            patch_shape=(512, 512),
             batch_size=1,
             raw_transform=raw_transform,
             sampler=sampler
             )
+        os.makedirs(self.prediction_dir, exist_ok=True)
         os.makedirs(self.label_dir, exist_ok=True)
+        os.makedirs(self.raw_dir, exist_ok=True)
 
     def __instantiate_logger(self) -> None:
         """Instantiate logger
@@ -333,7 +335,16 @@ class MoNuSegInference:
         mask["instance_types"] = calculate_instances(
             torch.unsqueeze(mask["nuclei_binary_map"], dim=0), mask["instance_map"]
         )
+        image_path = os.path.join(self.raw_dir, image_name)
+        label_path = os.path.join(self.label_dir, image_name)
+        instance_mask = np.squeeze(mask["instance_map"].cpu().numpy())
+        raw_image = np.squeeze(img.cpu().numpy())
+        save_image = raw_image.transpose(1, 2, 0)
+        if instance_mask.dtype != np.uint16:
+            instance_mask = instance_mask.astype(np.uint16)
 
+        tiff.imwrite(image_path, save_image)
+        tiff.imwrite(label_path, instance_mask)
         model.zero_grad()
 
         if self.mixed_precision:
@@ -452,9 +463,8 @@ class MoNuSegInference:
         remapped_instance_pred = (remap_label(predictions["instance_map"]))
         prediction_mask = np.squeeze(remapped_instance_pred)
         if prediction_mask.dtype != np.int32:
-            prediction_mask = prediction_mask.cpu().numpy().astype(np.int32)
-        output_path = os.path.join(self.label_dir, image_name)
-        print('Mask shape and datatype: ', prediction_mask.shape, prediction_mask.dtype)
+            prediction_mask = prediction_mask.cpu().numpy().astype(np.uint16)
+        output_path = os.path.join(self.prediction_dir, image_name)
 
         tiff.imwrite(output_path, prediction_mask)
         remapped_gt = remap_label(instance_maps_gt)
