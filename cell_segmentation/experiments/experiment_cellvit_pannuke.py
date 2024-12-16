@@ -181,13 +181,11 @@ class ExperimentCellVitPanNuke(BaseExperiment):
         ### Data handling
         train_transforms, val_transforms = self.get_transforms(
             self.run_conf["transformations"],
-            input_shape=self.run_conf["data"].get("input_shape", 256),
+            input_shape=self.run_conf["data"].get("input_shape", 512),
         )
-
-        train_dataset, val_dataset = self.get_datasets(
-            train_transforms=train_transforms,
-            val_transforms=val_transforms,
-        )
+        placeholder = (1, 0)
+        train_dataset, val_dataset = placeholder
+        
 
         # load sampler
         training_sampler = self.get_sampler(
@@ -197,14 +195,16 @@ class ExperimentCellVitPanNuke(BaseExperiment):
         )
 
         # define dataloaders
-        train_dataloader = DataLoader(
+        raw_train_dataloader = DataLoader(
             train_dataset,
-            batch_size=self.run_conf["training"]["batch_size"],
+            batch_size=32,
             sampler=training_sampler,
             num_workers=16,
             pin_memory=False,
             worker_init_fn=self.seed_worker,
         )
+        train_dataset = 
+        train_dataloader = 
 
         val_dataloader = DataLoader(
             val_dataset,

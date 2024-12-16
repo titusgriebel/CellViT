@@ -301,9 +301,6 @@ class CellViTTrainer(BaseTrainer):
         binary_dice_scores = []
         binary_jaccard_scores = []
         pq_scores = []
-        cell_type_pq_scores = []
-        tissue_pred = []
-        tissue_gt = []
         val_example_img = None
 
         # reset metrics
@@ -336,16 +333,10 @@ class CellViTTrainer(BaseTrainer):
                     binary_jaccard_scores + batch_metrics["binary_jaccard_scores"]
                 )
                 pq_scores = pq_scores + batch_metrics["pq_scores"]
-                cell_type_pq_scores = (
-                    cell_type_pq_scores + batch_metrics["cell_type_pq_scores"]
-                )
-                tissue_pred.append(batch_metrics["tissue_pred"])
-                tissue_gt.append(batch_metrics["tissue_gt"])
                 val_loop.set_postfix(
                     {
                         "Loss": np.round(self.loss_avg_tracker["Total_Loss"].avg, 3),
                         "Dice": np.round(np.nanmean(binary_dice_scores), 3),
-                        "Pred-Acc": np.round(self.batch_avg_tissue_acc.avg, 3),
                     }
                 )
 
@@ -354,19 +345,12 @@ class CellViTTrainer(BaseTrainer):
         binary_dice_scores = np.array(binary_dice_scores)
         binary_jaccard_scores = np.array(binary_jaccard_scores)
         pq_scores = np.array(pq_scores)
-        tissue_detection_accuracy = accuracy_score(
-            y_true=np.concatenate(tissue_gt), y_pred=np.concatenate(tissue_pred)
-        )
 
         scalar_metrics = {
             "Loss/Validation": self.loss_avg_tracker["Total_Loss"].avg,
             "Binary-Cell-Dice-Mean/Validation": np.nanmean(binary_dice_scores),
             "Binary-Cell-Jacard-Mean/Validation": np.nanmean(binary_jaccard_scores),
-            "Tissue-Multiclass-Accuracy/Validation": tissue_detection_accuracy,
             "bPQ/Validation": np.nanmean(pq_scores),
-            "mPQ/Validation": np.nanmean(
-                [np.nanmean(pq) for pq in cell_type_pq_scores]
-            ),
         }
 
         for branch, loss_fns in self.loss_fn_dict.items():
@@ -382,8 +366,6 @@ class CellViTTrainer(BaseTrainer):
             f"Binary-Cell-Dice: {np.nanmean(binary_dice_scores):.4f} - "
             f"Binary-Cell-Jacard: {np.nanmean(binary_jaccard_scores):.4f} - "
             f"bPQ-Score: {np.nanmean(pq_scores):.4f} - "
-            f"mPQ-Score: {scalar_metrics['mPQ/Validation']:.4f} - "
-            f"Tissue-MC-Acc.: {tissue_detection_accuracy:.4f}"
         )
 
         image_metrics = {"Example-Predictions/Validation": val_example_img}
@@ -471,14 +453,11 @@ class CellViTTrainer(BaseTrainer):
         )  # shape: (batch_size, 2, H, W)
         (
             predictions["instance_map"],
+            predictions["instance_types"],
         ) = self.model.calculate_instance_map(
             predictions, self.magnification
         )  # shape: (batch_size, H, W)
-        predictions["instance_types_nuclei"] = self.model.generate_instance_nuclei_map(
-            predictions["instance_map"], predictions["instance_types"]
-        ).to(
-            self.device
-        )  # shape: (batch_size, num_nuclei_classes, H, W)
+        
 
         if "regression_map" not in predictions.keys():
             predictions["regression_map"] = None
@@ -491,7 +470,6 @@ class CellViTTrainer(BaseTrainer):
             instance_types_nuclei=predictions["instance_types_nuclei"],
             batch_size=predictions["tissue_types"].shape[0],
             regression_map=predictions["regression_map"],
-            num_nuclei_classes=self.num_classes,
         )
 
         return predictions
@@ -561,7 +539,6 @@ class CellViTTrainer(BaseTrainer):
             if branch in [
                 "instance_map",
                 "instance_types",
-                "instance_types_nuclei",
             ]:
                 continue
             if branch not in self.loss_fn_dict:
@@ -602,38 +579,17 @@ class CellViTTrainer(BaseTrainer):
         predictions = predictions.get_dict()
         gt = gt.get_dict()
 
-        # Tissue Tpyes logits to probs and argmax to get class
-        predictions["tissue_types_classes"] = F.softmax(
-            predictions["tissue_types"], dim=-1
-        )
-        pred_tissue = (
-            torch.argmax(predictions["tissue_types_classes"], dim=-1)
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(np.uint8)
-        )
+        
         predictions["instance_map"] = predictions["instance_map"].detach().cpu()
-        predictions["instance_types_nuclei"] = (
-            predictions["instance_types_nuclei"].detach().cpu().numpy().astype("int32")
-        )
-        gt["tissue_types"] = gt["tissue_types"].detach().cpu().numpy().astype(np.uint8)
+        
         gt["nuclei_binary_map"] = torch.argmax(gt["nuclei_binary_map"], dim=1).type(
             torch.uint8
         )
-        gt["instance_types_nuclei"] = (
-            gt["instance_types_nuclei"].detach().cpu().numpy().astype("int32")
-        )
-
-        tissue_detection_accuracy = accuracy_score(
-            y_true=gt["tissue_types"], y_pred=pred_tissue
-        )
-        self.batch_avg_tissue_acc.update(tissue_detection_accuracy)
 
         binary_dice_scores = []
         binary_jaccard_scores = []
 
-        for i in range(len(pred_tissue)):
+        for i in range(len(predictions["instance_map"])):
             # binary dice score: Score for cell detection per image, without background
             pred_binary_map = torch.argmax(predictions["nuclei_binary_map"][i], dim=0)
             target_binary_map = gt["nuclei_binary_map"][i]
@@ -777,7 +733,7 @@ class CellViTTrainer(BaseTrainer):
         imgs: Union[torch.Tensor, np.ndarray],
         predictions: DataclassHVStorage,
         gt: DataclassHVStorage,
-        num_nuclei_classes: int,
+        num_nuclei_classes: 2,
         num_images: int = 2,
     ) -> plt.Figure:
         """Generate example plot with image, binary_pred, hv-map and instance map from prediction and ground-truth

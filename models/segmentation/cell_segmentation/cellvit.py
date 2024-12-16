@@ -661,7 +661,7 @@ class DataclassHVStorage:
     h: int = 256
     w: int = 256
     num_tissue_classes: int = 19
-    num_nuclei_classes: int = 6
+    num_nuclei_classes: int = 2
 
     # def __post_init__(self):
     #     # check shape of every element
