@@ -27,7 +27,7 @@ configs/PanNuke
 configs/Lizzard
 configs/Conic
 configs/TCGA
-
+*.sh
 # pretrained models
 *.pth
 docker/

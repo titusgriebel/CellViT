@@ -11,14 +11,12 @@ from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
-import wandb
 from base_ml.base_early_stopping import EarlyStopping
 from pathlib import Path
 from torch.nn.modules.loss import _Loss
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader
-from utils.tools import flatten_dict
 
 
 class BaseTrainer:

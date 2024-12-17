@@ -1,3 +1,4 @@
+## this is modified from logs_paper/CellViTHV/SAM-H/Fold-3
 logging:
   mode: online
   project: Cell-Segmentation
