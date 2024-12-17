@@ -56,8 +56,6 @@ class CellViT(nn.Module):
 
     def __init__(
         self,
-        num_nuclei_classes: int,
-        num_tissue_classes: int,
         embed_dim: int,
         input_channels: int,
         depth: int,
@@ -75,8 +73,6 @@ class CellViT(nn.Module):
         assert len(extract_layers) == 4, "Please provide 4 layers for skip connections"
 
         self.patch_size = 16
-        self.num_tissue_classes = num_tissue_classes
-        self.num_nuclei_classes = num_nuclei_classes
         self.embed_dim = embed_dim
         self.input_channels = input_channels
         self.depth = depth
@@ -90,7 +86,6 @@ class CellViT(nn.Module):
 
         self.encoder = ViTCellViT(
             patch_size=self.patch_size,
-            num_classes=self.num_tissue_classes,
             embed_dim=self.embed_dim,
             depth=self.depth,
             num_heads=self.num_heads,
@@ -406,7 +401,6 @@ class CellViT256(CellViT):
         self,
         model256_path: Union[Path, str],
         num_nuclei_classes: int,
-        num_tissue_classes: int,
         drop_rate: float = 0,
         attn_drop_rate: float = 0,
         drop_path_rate: float = 0,
@@ -420,12 +414,8 @@ class CellViT256(CellViT):
         self.qkv_bias = True
         self.extract_layers = [3, 6, 9, 12]
         self.input_channels = 3  # RGB
-        self.num_tissue_classes = num_tissue_classes
-        self.num_nuclei_classes = num_nuclei_classes
 
         super().__init__(
-            num_nuclei_classes=num_nuclei_classes,
-            num_tissue_classes=num_tissue_classes,
             embed_dim=self.embed_dim,
             input_channels=self.input_channels,
             depth=self.depth,
@@ -475,8 +465,6 @@ class CellViTSAM(CellViT):
     def __init__(
         self,
         model_path: Union[Path, str],
-        num_nuclei_classes: int,
-        num_tissue_classes: int,
         vit_structure: Literal["SAM-B", "SAM-L", "SAM-H"],
         drop_rate: float = 0,
         regression_loss: bool = False,
@@ -493,12 +481,9 @@ class CellViTSAM(CellViT):
         self.input_channels = 3  # RGB
         self.mlp_ratio = 4
         self.qkv_bias = True
-        self.num_nuclei_classes = num_nuclei_classes
         self.model_path = model_path
 
         super().__init__(
-            num_nuclei_classes=num_nuclei_classes,
-            num_tissue_classes=num_tissue_classes,
             embed_dim=self.embed_dim,
             input_channels=self.input_channels,
             depth=self.depth,
@@ -526,11 +511,7 @@ class CellViTSAM(CellViT):
             out_chans=self.prompt_embed_dim,
         )
 
-        self.classifier_head = (
-            nn.Linear(self.prompt_embed_dim, num_tissue_classes)
-            if num_tissue_classes > 0
-            else nn.Identity()
-        )
+            
 
     def load_pretrained_encoder(self, model_path):
         """Load pretrained SAM encoder from provided path
@@ -660,8 +641,6 @@ class DataclassHVStorage:
     regression_loss: bool = False
     h: int = 256
     w: int = 256
-    num_tissue_classes: int = 19
-    num_nuclei_classes: int = 2
 
     # def __post_init__(self):
     #     # check shape of every element

@@ -14,7 +14,7 @@ from cell_segmentation.datasets.pannuke import PanNukeDataset
 
 
 def select_dataset(
-    dataset_name: str, split: str, dataset_config: dict, transforms: Callable = None
+    dataset_name: str, split: str, dataset_path, transforms: Callable = None
 ) -> Dataset:
     """Select a cell segmentation dataset from the provided ones, currently just PanNuke is implemented here
 
@@ -40,33 +40,12 @@ def select_dataset(
     ], "Unknown split type!"
 
     if dataset_name.lower() == "pannuke":
-        if split == "train":
-            folds = dataset_config["train_folds"]
-        if split == "val" or split == "validation":
-            folds = dataset_config["val_folds"]
-        if split == "test":
-            folds = dataset_config["test_folds"]
         dataset = PanNukeDataset(
-            dataset_path=dataset_config["dataset_path"],
-            folds=folds,
+            dataset_path=dataset_path,
+            split=split,
             transforms=transforms,
-            stardist=dataset_config.get("stardist", False),
-            regression=dataset_config.get("regression_loss", False),
-        )
-    elif dataset_name.lower() == "conic":
-        if split == "train":
-            folds = dataset_config["train_folds"]
-        if split == "val" or split == "validation":
-            folds = dataset_config["val_folds"]
-        if split == "test":
-            folds = dataset_config["test_folds"]
-        dataset = CoNicDataset(
-            dataset_path=dataset_config["dataset_path"],
-            folds=folds,
-            transforms=transforms,
-            stardist=dataset_config.get("stardist", False),
-            regression=dataset_config.get("regression_loss", False),
-            # TODO: Stardist and regression loss
+            stardist=False,
+            regression=False,
         )
     else:
         raise NotImplementedError(f"Unknown dataset: {dataset_name}")

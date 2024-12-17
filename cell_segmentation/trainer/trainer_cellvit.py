@@ -78,7 +78,6 @@ class CellViTTrainer(BaseTrainer):
         logger: logging.Logger,
         logdir: Union[Path, str],
         num_classes: int,
-        dataset_config: dict,
         experiment_config: dict,
         early_stopping: EarlyStopping = None,
         log_images: bool = False,
@@ -101,7 +100,6 @@ class CellViTTrainer(BaseTrainer):
             mixed_precision=mixed_precision,
         )
         self.loss_fn_dict = loss_fn_dict
-        self.dataset_config = dataset_config
         self.magnification = magnification
 
         # setup logging objects
@@ -222,7 +220,7 @@ class CellViTTrainer(BaseTrainer):
         """
         # unpack batch
         imgs = batch[0].to(self.device)  # imgs shape: (batch_size, 3, H, W)
-        masks = batch[
+        masks = batch[          #torch-em loader contains instance map --> hv_map + binary map need to be generated here
             1
         ]  # dict: keys: "instance_map", "nuclei_map", "nuclei_binary_map", "hv_map"
 
@@ -451,10 +449,8 @@ class CellViTTrainer(BaseTrainer):
         predictions["nuclei_binary_map"] = F.softmax(
             predictions["nuclei_binary_map"], dim=1
         )  # shape: (batch_size, 2, H, W)
-        (
-            predictions["instance_map"],
-            predictions["instance_types"],
-        ) = self.model.calculate_instance_map(
+
+        predictions["instance_map"] = self.model.calculate_instance_map(
             predictions, self.magnification
         )  # shape: (batch_size, H, W)
         
@@ -465,10 +461,8 @@ class CellViTTrainer(BaseTrainer):
         predictions = DataclassHVStorage(
             nuclei_binary_map=predictions["nuclei_binary_map"],
             hv_map=predictions["hv_map"],
+            batch_size=32,
             instance_map=predictions["instance_map"],
-            instance_types=predictions["instance_types"],
-            instance_types_nuclei=predictions["instance_types_nuclei"],
-            batch_size=predictions["tissue_types"].shape[0],
             regression_map=predictions["regression_map"],
         )
 
@@ -514,7 +508,6 @@ class CellViTTrainer(BaseTrainer):
         gt = DataclassHVStorage(
             **gt,
             batch_size=gt["instance_map"].shape[0],
-            num_nuclei_classes=2,
         )
         return gt
 
@@ -614,8 +607,6 @@ class CellViTTrainer(BaseTrainer):
         batch_metrics = {
             "binary_dice_scores": binary_dice_scores,
             "binary_jaccard_scores": binary_jaccard_scores,
-            "tissue_pred": pred_tissue,
-            "tissue_gt": gt["tissue_types"],
         }
 
         return batch_metrics
@@ -634,40 +625,24 @@ class CellViTTrainer(BaseTrainer):
         gt = gt.get_dict()
 
         # Tissue Tpyes logits to probs and argmax to get class
-        predictions["tissue_types_classes"] = F.softmax(
-            predictions["tissue_types"], dim=-1
-        )
-        pred_tissue = (
-            torch.argmax(predictions["tissue_types_classes"], dim=-1)
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(np.uint8)
-        )
+    
         predictions["instance_map"] = predictions["instance_map"].detach().cpu()
         predictions["instance_types_nuclei"] = (
             predictions["instance_types_nuclei"].detach().cpu().numpy().astype("int32")
         )
         instance_maps_gt = gt["instance_map"].detach().cpu()
-        gt["tissue_types"] = gt["tissue_types"].detach().cpu().numpy().astype(np.uint8)
         gt["nuclei_binary_map"] = torch.argmax(gt["nuclei_binary_map"], dim=1).type(
             torch.uint8
         )
-        gt["instance_types_nuclei"] = (
-            gt["instance_types_nuclei"].detach().cpu().numpy().astype("int32")
-        )
 
-        tissue_detection_accuracy = accuracy_score(
-            y_true=gt["tissue_types"], y_pred=pred_tissue
-        )
-        self.batch_avg_tissue_acc.update(tissue_detection_accuracy)
+        
 
         binary_dice_scores = []
         binary_jaccard_scores = []
         cell_type_pq_scores = []
         pq_scores = []
 
-        for i in range(len(pred_tissue)):
+        for i in range(32):
             # binary dice score: Score for cell detection per image, without background
             pred_binary_map = torch.argmax(predictions["nuclei_binary_map"][i], dim=0)
             target_binary_map = gt["nuclei_binary_map"][i]
@@ -722,8 +697,6 @@ class CellViTTrainer(BaseTrainer):
             "binary_jaccard_scores": binary_jaccard_scores,
             "pq_scores": pq_scores,
             "cell_type_pq_scores": cell_type_pq_scores,
-            "tissue_pred": pred_tissue,
-            "tissue_gt": gt["tissue_types"],
         }
 
         return batch_metrics

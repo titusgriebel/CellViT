@@ -8,13 +8,11 @@
 # Institute for Artifical Intelligence in Medicine,
 # University Medicine Essen
 
-
 import logging
 import sys  # remove
 from pathlib import Path
 from typing import Callable, Tuple, Union
 import os
-import h5py
 import numpy as np
 import pandas as pd
 import torch
@@ -23,18 +21,53 @@ from numba import njit
 from PIL import Image
 from scipy.ndimage import center_of_mass, distance_transform_edt
 from glob import glob
-import cv2
 from natsort import natsorted
-from torch_em.data.datasets.histopathology.monuseg import get_monuseg_paths
-from torch_em.data.datasets.histopathology.tnbc import get_tnbc_paths
+from torch_em.data.datasets.histopathology.monuseg import get_monuseg_loader
+from torch_em.data.datasets.histopathology.lizard import get_lizard_loader
 sys.path.append("/user/titus.griebel/u12649/CellViT/cell_segmentation")  # remove
 from datasets.base_cell import CellDataset
-from utils.tools import fix_duplicates, get_bounding_box
 import imageio
 
 
+def fix_duplicates(inst_map: np.ndarray) -> np.ndarray:  # this and the following function could be imported 
+    """Re-label duplicated instances in an instance labelled mask.
 
+    Parameters
+    ----------
+        inst_map : np.ndarray
+            Instance labelled mask. Shape (H, W).
 
+    Returns
+    -------
+        np.ndarray:
+            The instance labelled mask without duplicated indices.
+            Shape (H, W).
+    """
+    current_max_id = np.amax(inst_map)
+    inst_list = list(np.unique(inst_map))
+    if 0 in inst_list:
+        inst_list.remove(0)
+
+    for inst_id in inst_list:
+        inst = np.array(inst_map == inst_id, np.uint8)
+        remapped_ids = ndimage.label(inst)[0]
+        remapped_ids[remapped_ids > 1] += current_max_id
+        inst_map[remapped_ids > 1] = remapped_ids[remapped_ids > 1]
+        current_max_id = np.amax(inst_map)
+
+    return inst_map
+
+def get_bounding_box(img):
+    """Get bounding box coordinate information."""
+    rows = np.any(img, axis=1)
+    cols = np.any(img, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    # due to python indexing, need to add 1 to max
+    # else accessing will be 1px in the box, not out
+    rmax += 1
+    cmax += 1
+    return [rmin, rmax, cmin, cmax]
 
 logger = logging.getLogger()
 logger.addHandler(logging.NullHandler())
@@ -89,6 +122,7 @@ class PanNukeDataset(CellDataset):
     def __init__(
         self,
         dataset_path: Union[Path, str],
+        split: int,
         transforms: Callable = None,
         stardist: bool = False,
         regression: bool = False,
@@ -100,54 +134,39 @@ class PanNukeDataset(CellDataset):
         self.transforms = transforms
         self.images = []
         self.masks = []
-        self.types = {}
         self.img_names = []
         self.cache_dataset = cache_dataset
         self.stardist = stardist
         self.regression = regression
         raw_labels = []
-        for dset in ['monuseg', 'tnbc']:
-            if dset == 'monuseg':
-                print('Getting monuseg data...')
-                image_paths, label_paths = get_monuseg_paths(os.path.join(self.data_path, dset), split='train', download=True)
-                img_dir = os.path.dirname(image_paths[0])
-                for tif in image_paths:
-                    img = imageio.imread(tif)
-                    img_uint8 = img.astype(np.uint8)
-                    img_outpath = os.path.join(img_dir, f"{os.path.splitext(os.path.basename(tif))[0]}_{dset}.png")
-                    print(img_uint8.shape)
-                    imageio.imwrite(img_outpath, img_uint8)
-                    self.images.append(img_outpath)
-                    self.img_names.append(Path(img_outpath).name)
-                raw_labels.extend(label_paths)     #add label paths for later preprocessing 
-            elif dset == 'tnbc':
-                print('Getting tnbc data...')
-                image_paths = get_tnbc_paths(os.path.join(self.data_path, dset), download=True)
-                img_dir = os.path.dirname(image_paths[0])
-                for h5 in image_paths:
-                    with h5py.File(h5, 'r') as f:
-                        img = f['raw'][:]
-                        img_uint8 = img.astype(np.uint8)
-                        img_outpath = os.path.join(img_dir, f"{os.path.splitext(os.path.basename(h5))[0]}_{dset}_raw.png")
-                        img_uint8 = img_uint8.transpose(1, 2, 0)
-                        imageio.imwrite(img_outpath, img_uint8)
-                        instance_label = f['labels/instances'][:]
-                        uint_label = instance_label.astype(np.uint16)
-                        label_outpath = os.path.join(img_dir, f'{os.path.splitext(os.path.basename(h5))[0]}_label.png')
-                        imageio.imwrite(label_outpath, uint_label)
-                        self.images.append(img_outpath)
-                        raw_labels.append(label_outpath)  
-                        self.img_names.append(Path(img_outpath).name)
-                        label = imageio.imread(raw_labels[0])
-                        print(label.shape)
+        self.split = split
+        
+        if self.split == 'train':
+            loader = get_monuseg_loader(path=os.path.join(self.data_path, 'monuseg'), split=self.split, patch_shape=(512, 512), download=True, batch_size=1) #replace this with generalist_loader once running!, put raw transforms and consecutive label trafo
+        else:
+            loader = get_monuseg_loader(path=os.path.join(self.data_path, 'monuseg'), split=self.split, patch_shape=(512, 512), download=True, batch_size=1) #replace this with generalist_loader once running!, put raw transforms and consecutive label trafo
+        count = 1
+        os.makedirs(os.path.join(dataset_path, self.split, 'images'), exist_ok=True)
+        os.makedirs(os.path.join(dataset_path, self.split, 'labels'), exist_ok=True)
+        for image, label in loader:
+            img_array = image.numpy()
+            label_array = label.numpy()   
+            img_array = img_array.squeeze()
+            label_array = label_array.squeeze()             
+            img_uint8 = img_array.astype(np.uint8)
+            uint_label = label_array.astype(np.uint16)
+            if not img_uint8.shape == (512, 512, 3):
+                img_uint8 = img_uint8.transpose(1, 2, 0)
+            assert img_uint8.shape == (512, 512, 3), f'Shape error: unexpected shape of {img_uint8.shape}'
+            imageio.imwrite(os.path.join(dataset_path, self.split, 'images', f'{count:04}.png'), img_uint8)
+            np.save(os.path.join(dataset_path, self.split, 'labels', f'{count:04}.npy'), uint_label)
+            self.images.append(os.path.join(dataset_path, self.split, 'images', f'{count:04}.png'))
+            raw_labels.append(os.path.join(dataset_path, self.split, 'labels', f'{count:04}.npy'))  
+            self.img_names.append(f'{count:04}.png')
+            count += 1
 
         for raw_label in raw_labels:
-            if not os.path.splitext(raw_label)[1] == ".npy":
-                label = imageio.imread(raw_label)
-            else:
-                label = np.load(raw_label)
-
-            print(label.shape)
+            label = np.load(raw_label, allow_pickle=True)
             outname = f"{os.path.splitext(os.path.basename(raw_label))[0]}.npy"
             # need to create instance map and type map with shape 256x256
             inst_map = np.zeros((512, 512))
@@ -222,10 +241,8 @@ class PanNukeDataset(CellDataset):
             img = transformed["image"]
             mask = transformed["mask"]
 
-        tissue_type = self.types[img_path.name]
-        inst_map = mask[:, :, 0].copy()
-        type_map = mask[:, :, 1].copy()
-        np_map = mask[:, :, 0].copy()
+        inst_map = mask.copy()
+        np_map = mask.copy()
         np_map[np_map > 0] = 1
         hv_map = PanNukeDataset.gen_instance_hv_map(inst_map)
 
@@ -237,7 +254,6 @@ class PanNukeDataset(CellDataset):
 
         masks = {
             "instance_map": torch.Tensor(inst_map).type(torch.int64),
-            "nuclei_type_map": torch.Tensor(type_map).type(torch.int64),
             "nuclei_binary_map": torch.Tensor(np_map).type(torch.int64),
             "hv_map": torch.Tensor(hv_map).type(torch.float32),
         }
@@ -251,7 +267,7 @@ class PanNukeDataset(CellDataset):
         if self.regression:
             masks["regression_map"] = PanNukeDataset.gen_regression_map(inst_map)
 
-        return img, masks, tissue_type, Path(img_path).name
+        return img, masks, Path(img_path).name
 
     def __len__(self) -> int:
         """Length of Dataset
@@ -293,8 +309,7 @@ class PanNukeDataset(CellDataset):
         mask_path = self.masks[index]
         mask = np.load(mask_path, allow_pickle=True)
         inst_map = mask[()]["inst_map"].astype(np.int32)
-        type_map = mask[()]["type_map"].astype(np.int32)
-        mask = np.stack([inst_map, type_map], axis=-1)
+        mask = inst_map
         return mask
 
     
@@ -506,4 +521,4 @@ class PanNukeDataset(CellDataset):
     
 
 
-dataset = PanNukeDataset(dataset_path='/mnt/lustre-grete/usr/u12649/scratch/data/cellvit')
+dataset = PanNukeDataset(dataset_path='/mnt/lustre-grete/usr/u12649/scratch/data/cellvit', split='test')
