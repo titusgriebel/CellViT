@@ -11,14 +11,12 @@ from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
-import wandb
 from base_ml.base_early_stopping import EarlyStopping
 from pathlib import Path
 from torch.nn.modules.loss import _Loss
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader
-from utils.tools import flatten_dict
 
 
 class BaseTrainer:
@@ -168,17 +166,13 @@ class BaseTrainer:
         """
 
         self.logger.info(f"Starting training, total number of epochs: {epochs}")
-        if metric_init is not None and self.start_epoch == 0:
-            wandb.log(metric_init, step=0)
         for epoch in range(self.start_epoch, epochs):
             # training epoch
             self.logger.info(f"Epoch: {epoch+1}/{epochs}")
             train_scalar_metrics, train_image_metrics = self.train_epoch(
                 epoch, train_dataloader, **kwargs
             )
-            wandb.log(train_scalar_metrics, step=epoch + 1)
-            if self.log_images:
-                wandb.log(train_image_metrics, step=epoch + 1)
+            
             if ((epoch + 1) % eval_every) == 0:
                 # validation epoch
                 (
@@ -186,18 +180,10 @@ class BaseTrainer:
                     val_image_metrics,
                     early_stopping_metric,
                 ) = self.validation_epoch(epoch, val_dataloader)
-                wandb.log(val_scalar_metrics, step=epoch + 1)
-                if self.log_images:
-                    wandb.log(val_image_metrics, step=epoch + 1)
 
             # log learning rate
             curr_lr = self.optimizer.param_groups[0]["lr"]
-            wandb.log(
-                {
-                    "Learning-Rate/Learning-Rate": curr_lr,
-                },
-                step=epoch + 1,
-            )
+            
             if (epoch + 1) % eval_every == 0:
                 # early stopping
                 if self.early_stopping is not None:
@@ -235,8 +221,6 @@ class BaseTrainer:
             "scheduler_state_dict": self.scheduler.state_dict(),
             "best_metric": best_metric,
             "best_epoch": best_epoch,
-            "config": flatten_dict(wandb.config),
-            "wandb_id": wandb.run.id,
             "logdir": str(self.logdir.resolve()),
             "run_name": str(Path(self.logdir).name),
             "scaler_state_dict": self.scaler.state_dict()

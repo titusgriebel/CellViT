@@ -8,14 +8,11 @@
 # Institute for Artifical Intelligence in Medicine,
 # University Medicine Essen
 
-
 import logging
 import sys  # remove
 from pathlib import Path
 from typing import Callable, Tuple, Union
-
-sys.path.append("/homes/fhoerst/histo-projects/CellViT/")  # remove
-
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -23,15 +20,89 @@ import yaml
 from numba import njit
 from PIL import Image
 from scipy.ndimage import center_of_mass, distance_transform_edt
+from glob import glob
+from natsort import natsorted
+from torch_em.data.datasets.histopathology.monuseg import get_monuseg_loader
+from torch_em.data.datasets.histopathology.lizard import get_lizard_loader
+sys.path.append("/user/titus.griebel/u12649/CellViT/cell_segmentation")  # remove
+from datasets.base_cell import CellDataset
+import imageio
 
-from cell_segmentation.datasets.base_cell import CellDataset
-from cell_segmentation.utils.tools import fix_duplicates, get_bounding_box
+
+def fix_duplicates(inst_map: np.ndarray) -> np.ndarray:  # this and the following function could be imported 
+    """Re-label duplicated instances in an instance labelled mask.
+
+    Parameters
+    ----------
+        inst_map : np.ndarray
+            Instance labelled mask. Shape (H, W).
+
+    Returns
+    -------
+        np.ndarray:
+            The instance labelled mask without duplicated indices.
+            Shape (H, W).
+    """
+    current_max_id = np.amax(inst_map)
+    inst_list = list(np.unique(inst_map))
+    if 0 in inst_list:
+        inst_list.remove(0)
+
+    for inst_id in inst_list:
+        inst = np.array(inst_map == inst_id, np.uint8)
+        remapped_ids = ndimage.label(inst)[0]
+        remapped_ids[remapped_ids > 1] += current_max_id
+        inst_map[remapped_ids > 1] = remapped_ids[remapped_ids > 1]
+        current_max_id = np.amax(inst_map)
+
+    return inst_map
+
+def get_bounding_box(img):
+    """Get bounding box coordinate information."""
+    rows = np.any(img, axis=1)
+    cols = np.any(img, axis=0)
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    # due to python indexing, need to add 1 to max
+    # else accessing will be 1px in the box, not out
+    rmax += 1
+    cmax += 1
+    return [rmin, rmax, cmin, cmax]
 
 logger = logging.getLogger()
 logger.addHandler(logging.NullHandler())
 
-from natsort import natsorted
+def remap_label(pred, by_size=False):
+    """
+    Rename all instance id so that the id is contiguous i.e [0, 1, 2, 3]
+    not [0, 2, 4, 6]. The ordering of instances (which one comes first)
+    is preserved unless by_size=True, then the instances will be reordered
+    so that bigger nucler has smaller ID
 
+    Args:
+        pred    : the 2d array contain instances where each instances is marked
+                  by non-zero integer
+        by_size : renaming with larger nuclei has smaller id (on-top)
+    """
+    pred_id = list(np.unique(pred))
+    if 0 in pred_id:
+        pred_id.remove(0)
+    if len(pred_id) == 0:
+        return pred  # no label
+    if by_size:
+        pred_size = []
+        for inst_id in pred_id:
+            size = (pred == inst_id).sum()
+            pred_size.append(size)
+        # sort the id by size in descending order
+        pair_list = zip(pred_id, pred_size)
+        pair_list = sorted(pair_list, key=lambda x: x[1], reverse=True)
+        pred_id, pred_size = zip(*pair_list)
+
+    new_pred = np.zeros(pred.shape, np.int32)
+    for idx, inst_id in enumerate(pred_id):
+        new_pred[pred == inst_id] = idx + 1
+    return new_pred
 
 class PanNukeDataset(CellDataset):
     """PanNuke dataset
@@ -51,53 +122,69 @@ class PanNukeDataset(CellDataset):
     def __init__(
         self,
         dataset_path: Union[Path, str],
-        folds: Union[int, list[int]],
+        split: int,
         transforms: Callable = None,
         stardist: bool = False,
         regression: bool = False,
         cache_dataset: bool = False,
     ) -> None:
-        if isinstance(folds, int):
-            folds = [folds]
 
-        self.dataset = Path(dataset_path).resolve()
+
+        self.data_path = dataset_path
         self.transforms = transforms
         self.images = []
         self.masks = []
-        self.types = {}
         self.img_names = []
-        self.folds = folds
         self.cache_dataset = cache_dataset
         self.stardist = stardist
         self.regression = regression
-        for fold in folds:
-            image_path = self.dataset / f"fold{fold}" / "images"
-            fold_images = [
-                f for f in natsorted(image_path.glob("*.png")) if f.is_file()
-            ]
+        raw_labels = []
+        self.split = split
+        
+        if self.split == 'train':  # insert concat train loader
+            loader = get_monuseg_loader(path=os.path.join(self.data_path, 'monuseg'), split=self.split, patch_shape=(512, 512), download=True, batch_size=1) #replace this with generalist_loader once running!, put raw transforms and consecutive label trafo
+        else:  # insert concat val loader 
+            loader = get_monuseg_loader(path=os.path.join(self.data_path, 'monuseg'), split=self.split, patch_shape=(512, 512), download=True, batch_size=1) #replace this with generalist_loader once running!, put raw transforms and consecutive label trafo
+        count = 1
+        os.makedirs(os.path.join(dataset_path, self.split, 'images'), exist_ok=True)
+        os.makedirs(os.path.join(dataset_path, self.split, 'labels'), exist_ok=True)
+        for image, label in loader:
+            img_array = image.numpy()
+            label_array = label.numpy()   
+            img_array = img_array.squeeze()
+            label_array = label_array.squeeze()             
+            img_uint8 = img_array.astype(np.uint8)
+            uint_label = label_array.astype(np.uint16)
+            if not img_uint8.shape == (512, 512, 3):
+                img_uint8 = img_uint8.transpose(1, 2, 0)
+            assert img_uint8.shape == (512, 512, 3), f'Shape error: unexpected shape of {img_uint8.shape}'
+            imageio.imwrite(os.path.join(dataset_path, self.split, 'images', f'{count:04}.png'), img_uint8)
+            np.save(os.path.join(dataset_path, self.split, 'labels', f'{count:04}.npy'), uint_label)
+            self.images.append(os.path.join(dataset_path, self.split, 'images', f'{count:04}.png'))
+            raw_labels.append(os.path.join(dataset_path, self.split, 'labels', f'{count:04}.npy'))  
+            self.img_names.append(f'{count:04}.png')
+            count += 1
 
-            # sanity_check: mask must exist for image
-            for fold_image in fold_images:
-                mask_path = (
-                    self.dataset / f"fold{fold}" / "labels" / f"{fold_image.stem}.npy"
-                )
-                if mask_path.is_file():
-                    self.images.append(fold_image)
-                    self.masks.append(mask_path)
-                    self.img_names.append(fold_image.name)
+        for raw_label in raw_labels:
+            label = np.load(raw_label, allow_pickle=True)
+            outname = f"{os.path.splitext(os.path.basename(raw_label))[0]}.npy"
+            # need to create instance map and type map with shape 256x256
+            inst_map = np.zeros((512, 512))
+            num_nuc = 0
+            for j in range(5):
+                # copy value from new array if value is not equal 0
+                layer_res = remap_label(label[:, :])
+                # inst_map = np.where(mask[:,:,j] != 0, mask[:,:,j], inst_map)
+                inst_map = np.where(layer_res != 0, layer_res + num_nuc, inst_map)
+                num_nuc = num_nuc + np.max(layer_res)
+            inst_map = remap_label(inst_map)
+            label_outpath = os.path.join(os.path.dirname(raw_label), outname)
+            outdict = {"inst_map": inst_map}
+            np.save(label_outpath, outdict)
+            self.masks.append(label_outpath)
+        assert len(self.masks) == len(self.images), 'Label / Image mismatch'
 
-                else:
-                    logger.debug(
-                        "Found image {fold_image}, but no corresponding annotation file!"
-                    )
-            fold_types = pd.read_csv(self.dataset / f"fold{fold}" / "types.csv")
-            fold_type_dict = fold_types.set_index("img")["type"].to_dict()
-            self.types = {
-                **self.types,
-                **fold_type_dict,
-            }  # careful - should all be named differently
 
-        logger.info(f"Created Pannuke Dataset by using fold(s) {self.folds}")
         logger.info(f"Resulting dataset length: {self.__len__()}")
 
         if self.cache_dataset:
@@ -154,10 +241,8 @@ class PanNukeDataset(CellDataset):
             img = transformed["image"]
             mask = transformed["mask"]
 
-        tissue_type = self.types[img_path.name]
-        inst_map = mask[:, :, 0].copy()
-        type_map = mask[:, :, 1].copy()
-        np_map = mask[:, :, 0].copy()
+        inst_map = mask.copy()
+        np_map = mask.copy()
         np_map[np_map > 0] = 1
         hv_map = PanNukeDataset.gen_instance_hv_map(inst_map)
 
@@ -169,7 +254,6 @@ class PanNukeDataset(CellDataset):
 
         masks = {
             "instance_map": torch.Tensor(inst_map).type(torch.int64),
-            "nuclei_type_map": torch.Tensor(type_map).type(torch.int64),
             "nuclei_binary_map": torch.Tensor(np_map).type(torch.int64),
             "hv_map": torch.Tensor(hv_map).type(torch.float32),
         }
@@ -183,7 +267,7 @@ class PanNukeDataset(CellDataset):
         if self.regression:
             masks["regression_map"] = PanNukeDataset.gen_regression_map(inst_map)
 
-        return img, masks, tissue_type, Path(img_path).name
+        return img, masks, Path(img_path).name
 
     def __len__(self) -> int:
         """Length of Dataset
@@ -225,111 +309,10 @@ class PanNukeDataset(CellDataset):
         mask_path = self.masks[index]
         mask = np.load(mask_path, allow_pickle=True)
         inst_map = mask[()]["inst_map"].astype(np.int32)
-        type_map = mask[()]["type_map"].astype(np.int32)
-        mask = np.stack([inst_map, type_map], axis=-1)
+        mask = inst_map
         return mask
 
-    def load_cell_count(self):
-        """Load Cell count from cell_count.csv file. File must be located inside the fold folder
-        and named "cell_count.csv"
-
-        Example file beginning:
-            Image,Neoplastic,Inflammatory,Connective,Dead,Epithelial
-            0_0.png,4,2,2,0,0
-            0_1.png,8,1,1,0,0
-            0_10.png,17,0,1,0,0
-            0_100.png,10,0,11,0,0
-            ...
-        """
-        df_placeholder = []
-        for fold in self.folds:
-            csv_path = self.dataset / f"fold{fold}" / "cell_count.csv"
-            cell_count = pd.read_csv(csv_path, index_col=0)
-            df_placeholder.append(cell_count)
-        self.cell_count = pd.concat(df_placeholder)
-        self.cell_count = self.cell_count.reindex(self.img_names)
-
-    def get_sampling_weights_tissue(self, gamma: float = 1) -> torch.Tensor:
-        """Get sampling weights calculated by tissue type statistics
-
-        For this, a file named "weight_config.yaml" with the content:
-            tissue:
-                tissue_1: xxx
-                tissue_2: xxx (name of tissue: count)
-                ...
-        Must exists in the dataset main folder (parent path, not inside the folds)
-
-        Args:
-            gamma (float, optional): Gamma scaling factor, between 0 and 1.
-                1 means total balancing, 0 means original weights. Defaults to 1.
-
-        Returns:
-            torch.Tensor: Weights for each sample
-        """
-        assert 0 <= gamma <= 1, "Gamma must be between 0 and 1"
-        with open(
-            (self.dataset / "weight_config.yaml").resolve(), "r"
-        ) as run_config_file:
-            yaml_config = yaml.safe_load(run_config_file)
-            tissue_counts = dict(yaml_config)["tissue"]
-
-        # calculate weight for each tissue
-        weights_dict = {}
-        k = np.sum(list(tissue_counts.values()))
-        for tissue, count in tissue_counts.items():
-            w = k / (gamma * count + (1 - gamma) * k)
-            weights_dict[tissue] = w
-
-        weights = []
-        for idx in range(self.__len__()):
-            img_idx = self.img_names[idx]
-            type_str = self.types[img_idx]
-            weights.append(weights_dict[type_str])
-
-        return torch.Tensor(weights)
-
-    def get_sampling_weights_cell(self, gamma: float = 1) -> torch.Tensor:
-        """Get sampling weights calculated by cell type statistics
-
-        Args:
-            gamma (float, optional): Gamma scaling factor, between 0 and 1.
-                1 means total balancing, 0 means original weights. Defaults to 1.
-
-        Returns:
-            torch.Tensor: Weights for each sample
-        """
-        assert 0 <= gamma <= 1, "Gamma must be between 0 and 1"
-        assert hasattr(self, "cell_count"), "Please run .load_cell_count() in advance!"
-        binary_weight_factors = np.array([4191, 4132, 6140, 232, 1528])
-        k = np.sum(binary_weight_factors)
-        cell_counts_imgs = np.clip(self.cell_count.to_numpy(), 0, 1)
-        weight_vector = k / (gamma * binary_weight_factors + (1 - gamma) * k)
-        img_weight = (1 - gamma) * np.max(cell_counts_imgs, axis=-1) + gamma * np.sum(
-            cell_counts_imgs * weight_vector, axis=-1
-        )
-        img_weight[np.where(img_weight == 0)] = np.min(
-            img_weight[np.nonzero(img_weight)]
-        )
-
-        return torch.Tensor(img_weight)
-
-    def get_sampling_weights_cell_tissue(self, gamma: float = 1) -> torch.Tensor:
-        """Get combined sampling weights by calculating tissue and cell sampling weights,
-        normalizing them and adding them up to yield one score.
-
-        Args:
-            gamma (float, optional): Gamma scaling factor, between 0 and 1.
-                1 means total balancing, 0 means original weights. Defaults to 1.
-
-        Returns:
-            torch.Tensor: Weights for each sample
-        """
-        assert 0 <= gamma <= 1, "Gamma must be between 0 and 1"
-        tw = self.get_sampling_weights_tissue(gamma)
-        cw = self.get_sampling_weights_cell(gamma)
-        weights = tw / torch.max(tw) + cw / torch.max(cw)
-
-        return weights
+    
 
     @staticmethod
     def gen_instance_hv_map(inst_map: np.ndarray) -> np.ndarray:
@@ -535,3 +518,7 @@ class PanNukeDataset(CellDataset):
             dist[1, y1:y2, x1:x2] = y_dist_map
 
         return dist
+    
+
+
+dataset = PanNukeDataset(dataset_path='/mnt/lustre-grete/usr/u12649/scratch/data/cellvit', split='test')

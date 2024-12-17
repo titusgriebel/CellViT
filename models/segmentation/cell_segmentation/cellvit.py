@@ -56,8 +56,6 @@ class CellViT(nn.Module):
 
     def __init__(
         self,
-        num_nuclei_classes: int,
-        num_tissue_classes: int,
         embed_dim: int,
         input_channels: int,
         depth: int,
@@ -75,8 +73,6 @@ class CellViT(nn.Module):
         assert len(extract_layers) == 4, "Please provide 4 layers for skip connections"
 
         self.patch_size = 16
-        self.num_tissue_classes = num_tissue_classes
-        self.num_nuclei_classes = num_nuclei_classes
         self.embed_dim = embed_dim
         self.input_channels = input_channels
         self.depth = depth
@@ -90,7 +86,6 @@ class CellViT(nn.Module):
 
         self.encoder = ViTCellViT(
             patch_size=self.patch_size,
-            num_classes=self.num_tissue_classes,
             embed_dim=self.embed_dim,
             depth=self.depth,
             num_heads=self.num_heads,
@@ -137,7 +132,6 @@ class CellViT(nn.Module):
         self.branches_output = {
             "nuclei_binary_map": 2 + offset_branches,
             "hv_map": 2,
-            "nuclei_type_maps": self.num_nuclei_classes,
         }
 
         self.nuclei_binary_map_decoder = self.create_upsampling_branch(
@@ -146,9 +140,7 @@ class CellViT(nn.Module):
         self.hv_map_decoder = self.create_upsampling_branch(
             2
         )  # todo: adapt for helper loss
-        self.nuclei_type_maps_decoder = self.create_upsampling_branch(
-            self.num_nuclei_classes
-        )
+
 
     def forward(self, x: torch.Tensor, retrieve_tokens: bool = False) -> dict:
         """Forward pass
@@ -177,7 +169,6 @@ class CellViT(nn.Module):
         out_dict = {}
 
         classifier_logits, _, z = self.encoder(x)
-        out_dict["tissue_types"] = classifier_logits
 
         z0, z1, z2, z3, z4 = x, *z
 
@@ -201,9 +192,7 @@ class CellViT(nn.Module):
         out_dict["hv_map"] = self._forward_upsample(
             z0, z1, z2, z3, z4, self.hv_map_decoder
         )
-        out_dict["nuclei_type_map"] = self._forward_upsample(
-            z0, z1, z2, z3, z4, self.nuclei_type_maps_decoder
-        )
+
         if retrieve_tokens:
             out_dict["tokens"] = z4
 
@@ -349,26 +338,20 @@ class CellViT(nn.Module):
         """
         # reshape to B, H, W, C
         predictions_ = predictions.copy()
-        predictions_["nuclei_type_map"] = predictions_["nuclei_type_map"].permute(
-            0, 2, 3, 1
-        )
+      
         predictions_["nuclei_binary_map"] = predictions_["nuclei_binary_map"].permute(
             0, 2, 3, 1
         )
         predictions_["hv_map"] = predictions_["hv_map"].permute(0, 2, 3, 1)
 
         cell_post_processor = DetectionCellPostProcessor(
-            nr_types=self.num_nuclei_classes, magnification=magnification, gt=False
+            magnification=magnification, gt=False
         )
         instance_preds = []
-        type_preds = []
 
         for i in range(predictions_["nuclei_binary_map"].shape[0]):
             pred_map = np.concatenate(
                 [
-                    torch.argmax(predictions_["nuclei_type_map"], dim=-1)[i]
-                    .detach()
-                    .cpu()[..., None],
                     torch.argmax(predictions_["nuclei_binary_map"], dim=-1)[i]
                     .detach()
                     .cpu()[..., None],
@@ -378,40 +361,13 @@ class CellViT(nn.Module):
             )
             instance_pred = cell_post_processor.post_process_cell_segmentation(pred_map)
             instance_preds.append(instance_pred[0])
-            type_preds.append(instance_pred[1])
 
-        return torch.Tensor(np.stack(instance_preds)), type_preds
+        return torch.Tensor(np.stack(instance_preds))
 
-    def generate_instance_nuclei_map(
-        self, instance_maps: torch.Tensor, type_preds: List[dict]
-    ) -> torch.Tensor:
-        """Convert instance map (binary) to nuclei type instance map
-
-        Args:
-            instance_maps (torch.Tensor): Binary instance map, each instance has own integer. Shape: (B, H, W)
-            type_preds (List[dict]): List (len=B) of dictionary with instance type information (compare post_process_hovernet function for more details)
-
-        Returns:
-            torch.Tensor: Nuclei type instance map. Shape: (B, self.num_nuclei_classes, H, W)
-        """
-        batch_size, h, w = instance_maps.shape
-        instance_type_nuclei_maps = torch.zeros(
-            (batch_size, h, w, self.num_nuclei_classes)
-        )
-        for i in range(batch_size):
-            instance_type_nuclei_map = torch.zeros((h, w, self.num_nuclei_classes))
-            instance_map = instance_maps[i]
-            type_pred = type_preds[i]
-            for nuclei, spec in type_pred.items():
-                nuclei_type = spec["type"]
-                instance_type_nuclei_map[:, :, nuclei_type][
-                    instance_map == nuclei
-                ] = nuclei
-
-            instance_type_nuclei_maps[i, :, :, :] = instance_type_nuclei_map
-
-        instance_type_nuclei_maps = instance_type_nuclei_maps.permute(0, 3, 1, 2)
-        return torch.Tensor(instance_type_nuclei_maps)
+    # def generate_instance_nuclei_map(
+    #     self, instance_maps: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     """Convert instance map (binary) to nuclei type instance map
 
     def freeze_encoder(self):
         """Freeze encoder to not train it"""
@@ -445,7 +401,6 @@ class CellViT256(CellViT):
         self,
         model256_path: Union[Path, str],
         num_nuclei_classes: int,
-        num_tissue_classes: int,
         drop_rate: float = 0,
         attn_drop_rate: float = 0,
         drop_path_rate: float = 0,
@@ -459,12 +414,8 @@ class CellViT256(CellViT):
         self.qkv_bias = True
         self.extract_layers = [3, 6, 9, 12]
         self.input_channels = 3  # RGB
-        self.num_tissue_classes = num_tissue_classes
-        self.num_nuclei_classes = num_nuclei_classes
 
         super().__init__(
-            num_nuclei_classes=num_nuclei_classes,
-            num_tissue_classes=num_tissue_classes,
             embed_dim=self.embed_dim,
             input_channels=self.input_channels,
             depth=self.depth,
@@ -514,8 +465,6 @@ class CellViTSAM(CellViT):
     def __init__(
         self,
         model_path: Union[Path, str],
-        num_nuclei_classes: int,
-        num_tissue_classes: int,
         vit_structure: Literal["SAM-B", "SAM-L", "SAM-H"],
         drop_rate: float = 0,
         regression_loss: bool = False,
@@ -532,12 +481,9 @@ class CellViTSAM(CellViT):
         self.input_channels = 3  # RGB
         self.mlp_ratio = 4
         self.qkv_bias = True
-        self.num_nuclei_classes = num_nuclei_classes
         self.model_path = model_path
 
         super().__init__(
-            num_nuclei_classes=num_nuclei_classes,
-            num_tissue_classes=num_tissue_classes,
             embed_dim=self.embed_dim,
             input_channels=self.input_channels,
             depth=self.depth,
@@ -565,11 +511,7 @@ class CellViTSAM(CellViT):
             out_chans=self.prompt_embed_dim,
         )
 
-        self.classifier_head = (
-            nn.Linear(self.prompt_embed_dim, num_tissue_classes)
-            if num_tissue_classes > 0
-            else nn.Identity()
-        )
+            
 
     def load_pretrained_encoder(self, model_path):
         """Load pretrained SAM encoder from provided path
@@ -610,7 +552,6 @@ class CellViTSAM(CellViT):
         out_dict = {}
 
         classifier_logits, _, z = self.encoder(x)
-        out_dict["tissue_types"] = self.classifier_head(classifier_logits)
 
         z0, z1, z2, z3, z4 = x, *z
 
@@ -633,9 +574,6 @@ class CellViTSAM(CellViT):
 
         out_dict["hv_map"] = self._forward_upsample(
             z0, z1, z2, z3, z4, self.hv_map_decoder
-        )
-        out_dict["nuclei_type_map"] = self._forward_upsample(
-            z0, z1, z2, z3, z4, self.nuclei_type_maps_decoder
         )
 
         if retrieve_tokens:
@@ -697,18 +635,12 @@ class DataclassHVStorage:
 
     nuclei_binary_map: torch.Tensor
     hv_map: torch.Tensor
-    tissue_types: torch.Tensor
-    nuclei_type_map: torch.Tensor
     instance_map: torch.Tensor
-    instance_types_nuclei: torch.Tensor
     batch_size: int
-    instance_types: list = None
     regression_map: torch.Tensor = None
     regression_loss: bool = False
     h: int = 256
     w: int = 256
-    num_tissue_classes: int = 19
-    num_nuclei_classes: int = 6
 
     # def __post_init__(self):
     #     # check shape of every element

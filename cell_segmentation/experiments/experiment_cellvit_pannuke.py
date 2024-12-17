@@ -78,34 +78,17 @@ class ExperimentCellVitPanNuke(BaseExperiment):
 
         # get the config for the current run
         self.run_conf = copy.deepcopy(self.default_conf)
-        self.run_conf["dataset_config"] = self.dataset_config
         self.run_name = f"{datetime.datetime.now().strftime('%Y-%m-%dT%H%M%S')}_{self.run_conf['logging']['log_comment']}"
 
-        wandb_run_id = generate_id()
-        resume = None
         if self.checkpoint is not None:
             wandb_run_id = self.checkpoint["wandb_id"]
             resume = "must"
             self.run_name = self.checkpoint["run_name"]
 
-        # initialize wandb
-        run = wandb.init(
-            project=self.run_conf["logging"]["project"],
-            tags=self.run_conf["logging"].get("tags", []),
-            name=self.run_name,
-            notes=self.run_conf["logging"]["notes"],
-            dir=self.run_conf["logging"]["wandb_dir"],
-            mode=self.run_conf["logging"]["mode"].lower(),
-            group=self.run_conf["logging"].get("group", str(uuid.uuid4())),
-            allow_val_change=True,
-            id=wandb_run_id,
-            resume=resume,
-            settings=wandb.Settings(start_method="fork"),
-        )
+        #  wandb
+      
 
         # get ids
-        self.run_conf["logging"]["run_id"] = run.id
-        self.run_conf["logging"]["wandb_file"] = run.id
 
         # overwrite configuration with sweep values are leave them as they are
         if self.run_conf["run_sweep"] is True:
@@ -121,12 +104,7 @@ class ExperimentCellVitPanNuke(BaseExperiment):
                 Path(self.default_conf["logging"]["log_dir"]) / self.run_name
             )
 
-        # update wandb
-        wandb.config.update(
-            self.run_conf, allow_val_change=True
-        )  # this may lead to the problem
-
-        # create output folder, instantiate logger and store config
+            # create output folder, instantiate logger and store config
         self.create_output_dir(self.run_conf["logging"]["log_dir"])
         self.logger = self.instantiate_logger()
         self.logger.info("Instantiated Logger. WandB init and config update finished.")
@@ -181,12 +159,12 @@ class ExperimentCellVitPanNuke(BaseExperiment):
         ### Data handling
         train_transforms, val_transforms = self.get_transforms(
             self.run_conf["transformations"],
-            input_shape=self.run_conf["data"].get("input_shape", 256),
+            input_shape=self.run_conf["data"].get("input_shape", 512),
         )
-
         train_dataset, val_dataset = self.get_datasets(
             train_transforms=train_transforms,
             val_transforms=val_transforms,
+            dset_path=self.default_conf["data"]["dataset_path"]
         )
 
         # load sampler
@@ -199,16 +177,17 @@ class ExperimentCellVitPanNuke(BaseExperiment):
         # define dataloaders
         train_dataloader = DataLoader(
             train_dataset,
-            batch_size=self.run_conf["training"]["batch_size"],
+            batch_size=2,
             sampler=training_sampler,
             num_workers=16,
             pin_memory=False,
             worker_init_fn=self.seed_worker,
         )
+   
 
         val_dataloader = DataLoader(
             val_dataset,
-            batch_size=128,
+            batch_size=1,
             num_workers=16,
             pin_memory=True,
             worker_init_fn=self.seed_worker,
@@ -225,8 +204,7 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             device=device,
             logger=self.logger,
             logdir=self.run_conf["logging"]["log_dir"],
-            num_classes=self.run_conf["data"]["num_nuclei_classes"],
-            dataset_config=self.dataset_config,
+            num_classes=2,
             early_stopping=early_stopping,
             experiment_config=self.run_conf,
             log_images=self.run_conf["logging"].get("log_images", False),
@@ -245,7 +223,6 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             epochs=self.run_conf["training"]["epochs"],
             train_dataloader=train_dataloader,
             val_dataloader=val_dataloader,
-            metric_init=self.get_wandb_init_dict(),
             unfreeze_epoch=self.run_conf["training"]["unfreeze_epoch"],
             eval_every=self.run_conf["training"].get("eval_every", 1),
         )
@@ -274,10 +251,6 @@ class ExperimentCellVitPanNuke(BaseExperiment):
         Args:
             dataset_path (Union[Path, str]): Path to dataset folder
         """
-        dataset_config_path = Path(dataset_path) / "dataset_config.yaml"
-        with open(dataset_config_path, "r") as dataset_config_file:
-            yaml_config = yaml.safe_load(dataset_config_file)
-            self.dataset_config = dict(yaml_config)
 
     def get_loss_fn(self, loss_fn_settings: dict) -> dict:
         """Create a dictionary with loss functions for all branches
@@ -468,6 +441,7 @@ class ExperimentCellVitPanNuke(BaseExperiment):
         self,
         train_transforms: Callable = None,
         val_transforms: Callable = None,
+        dset_path: str = None,
     ) -> Tuple[Dataset, Dataset]:
         """Retrieve training dataset and validation dataset
 
@@ -478,34 +452,13 @@ class ExperimentCellVitPanNuke(BaseExperiment):
         Returns:
             Tuple[Dataset, Dataset]: Training dataset and validation dataset
         """
-        if (
-            "val_split" in self.run_conf["data"]
-            and "val_folds" in self.run_conf["data"]
-        ):
-            raise RuntimeError(
-                "Provide either val_splits or val_folds in configuration file, not both."
-            )
-        if (
-            "val_split" not in self.run_conf["data"]
-            and "val_folds" not in self.run_conf["data"]
-        ):
-            raise RuntimeError(
-                "Provide either val_split or val_folds in configuration file, one is necessary."
-            )
-        if (
-            "val_split" not in self.run_conf["data"]
-            and "val_folds" not in self.run_conf["data"]
-        ):
-            raise RuntimeError(
-                "Provide either val_split or val_fold in configuration file, one is necessary."
-            )
         if "regression_loss" in self.run_conf["model"].keys():
             self.run_conf["data"]["regression_loss"] = True
 
         full_dataset = select_dataset(
             dataset_name="pannuke",
+            dataset_path=dset_path,
             split="train",
-            dataset_config=self.run_conf["data"],
             transforms=train_transforms,
         )
         if "val_split" in self.run_conf["data"]:
@@ -524,8 +477,8 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             train_dataset = full_dataset
             val_dataset = select_dataset(
                 dataset_name="pannuke",
-                split="validation",
-                dataset_config=self.run_conf["data"],
+                split="test",  # change this to val once the generalist dataset is implemented
+                dataset_path=dset_path,
                 transforms=val_transforms,
             )
 
@@ -567,8 +520,6 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             else:
                 model_class = CellViT
             model = model_class(
-                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
-                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
                 embed_dim=self.run_conf["model"]["embed_dim"],
                 input_channels=self.run_conf["model"].get("input_channels", 3),
                 depth=self.run_conf["model"]["depth"],
@@ -618,8 +569,6 @@ class ExperimentCellVitPanNuke(BaseExperiment):
                 model_class = CellViTSAM
             model = model_class(
                 model_path=pretrained_encoder,
-                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
-                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
                 vit_structure=backbone_type,
                 drop_rate=self.run_conf["training"].get("drop_rate", 0),
                 regression_loss=regression_loss,
