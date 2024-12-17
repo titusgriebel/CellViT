@@ -627,9 +627,6 @@ class CellViTTrainer(BaseTrainer):
         # Tissue Tpyes logits to probs and argmax to get class
     
         predictions["instance_map"] = predictions["instance_map"].detach().cpu()
-        predictions["instance_types_nuclei"] = (
-            predictions["instance_types_nuclei"].detach().cpu().numpy().astype("int32")
-        )
         instance_maps_gt = gt["instance_map"].detach().cpu()
         gt["nuclei_binary_map"] = torch.argmax(gt["nuclei_binary_map"], dim=1).type(
             torch.uint8
@@ -642,7 +639,7 @@ class CellViTTrainer(BaseTrainer):
         cell_type_pq_scores = []
         pq_scores = []
 
-        for i in range(32):
+        for i in range(len(predictions["instance_map"])):
             # binary dice score: Score for cell detection per image, without background
             pred_binary_map = torch.argmax(predictions["nuclei_binary_map"][i], dim=0)
             target_binary_map = gt["nuclei_binary_map"][i]
@@ -670,33 +667,11 @@ class CellViTTrainer(BaseTrainer):
             pq_scores.append(pq)
 
             # pq values per class (skip background)
-            nuclei_type_pq = []
-            for j in range(0, self.num_classes):
-                pred_nuclei_instance_class = remap_label(
-                    predictions["instance_types_nuclei"][i][j, ...]
-                )
-                target_nuclei_instance_class = remap_label(
-                    gt["instance_types_nuclei"][i][j, ...]
-                )
-
-                # if ground truth is empty, skip from calculation
-                if len(np.unique(target_nuclei_instance_class)) == 1:
-                    pq_tmp = np.nan
-                else:
-                    [_, _, pq_tmp], _ = get_fast_pq(
-                        pred_nuclei_instance_class,
-                        target_nuclei_instance_class,
-                        match_iou=0.5,
-                    )
-                nuclei_type_pq.append(pq_tmp)
-
-            cell_type_pq_scores.append(nuclei_type_pq)
 
         batch_metrics = {
             "binary_dice_scores": binary_dice_scores,
             "binary_jaccard_scores": binary_jaccard_scores,
             "pq_scores": pq_scores,
-            "cell_type_pq_scores": cell_type_pq_scores,
         }
 
         return batch_metrics

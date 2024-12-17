@@ -141,9 +141,9 @@ class PanNukeDataset(CellDataset):
         raw_labels = []
         self.split = split
         
-        if self.split == 'train':
+        if self.split == 'train':  # insert concat train loader 
             loader = get_monuseg_loader(path=os.path.join(self.data_path, 'monuseg'), split=self.split, patch_shape=(512, 512), download=True, batch_size=1) #replace this with generalist_loader once running!, put raw transforms and consecutive label trafo
-        else:
+        else:  # insert concat val loader 
             loader = get_monuseg_loader(path=os.path.join(self.data_path, 'monuseg'), split=self.split, patch_shape=(512, 512), download=True, batch_size=1) #replace this with generalist_loader once running!, put raw transforms and consecutive label trafo
         count = 1
         os.makedirs(os.path.join(dataset_path, self.split, 'images'), exist_ok=True)
