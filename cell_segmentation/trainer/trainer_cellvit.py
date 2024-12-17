@@ -461,7 +461,7 @@ class CellViTTrainer(BaseTrainer):
         predictions = DataclassHVStorage(
             nuclei_binary_map=predictions["nuclei_binary_map"],
             hv_map=predictions["hv_map"],
-            batch_size=32,
+            batch_size=len(predictions["instance_map"]),
             instance_map=predictions["instance_map"],
             regression_map=predictions["regression_map"],
         )

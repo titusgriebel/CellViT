@@ -177,7 +177,7 @@ class ExperimentCellVitPanNuke(BaseExperiment):
         # define dataloaders
         train_dataloader = DataLoader(
             train_dataset,
-            batch_size=32,
+            batch_size=2,
             sampler=training_sampler,
             num_workers=16,
             pin_memory=False,
@@ -187,7 +187,7 @@ class ExperimentCellVitPanNuke(BaseExperiment):
 
         val_dataloader = DataLoader(
             val_dataset,
-            batch_size=128,
+            batch_size=1,
             num_workers=16,
             pin_memory=True,
             worker_init_fn=self.seed_worker,
