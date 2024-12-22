@@ -74,7 +74,6 @@ class MoNuSegInference:
     def __init__(
         self,
         model_path: Union[Path, str],
-        dataset_name: Union[Path, str],
         data_path,
         outdir: Union[Path, str],
         gpu: int,
@@ -113,7 +112,6 @@ class MoNuSegInference:
         raw_transform = sam_training.identity
         self.inference_dataloader = get_loader(
             path=data_path,
-            dataset_name=dataset_name,
             patch_shape=(512, 512),
             batch_size=1,
             raw_transform=raw_transform,
@@ -1015,14 +1013,9 @@ class InferenceCellViTMoNuSegParser:
             "--model",
             type=str,
             help="Model checkpoint file that is used for inference",
-            default="/homes/fhoerst/histo-projects/CellViT/results/PanNuke/Revision/CellViT/Common-Loss/SAM-H/x20/Fold-1-x20/checkpoints/latest_checkpoint.pth",
+            default=None,
         )
-        parser.add_argument(
-            "--dataset",
-            type=str,
-            help="Path to MoNuSeg dataset.",
-            default="/projects/datashare/tio/histopathology/public-datasets/MoNuSeg/1024/testing",
-        )
+
         parser.add_argument(
             "--data", type=str, help="Path where datasets are stored", required=True
         )
@@ -1075,7 +1068,6 @@ if __name__ == "__main__":
 
     inf = MoNuSegInference(
         model_path=configuration["model"],
-        dataset_name=configuration["dataset"],
         data_path=configuration["data"],
         outdir=configuration["outdir"],
         gpu=configuration["gpu"],

@@ -5,13 +5,9 @@ from torch_em.data.datasets import util
 import torch_em
 
 
-def get_loader(path, dataset_name, patch_shape, batch_size, **kwargs):
-    image_paths = natsorted(
-        glob(os.path.join(path, dataset_name, "loaded_testset", "images", "*.tiff"))
-    )
-    label_paths = natsorted(
-        glob(os.path.join(path, dataset_name, "loaded_testset", "labels", "*.tiff"))
-    )
+def get_loader(path, patch_shape, batch_size, **kwargs):
+    image_paths = natsorted(glob(os.path.join(path, "images", "*")))
+    label_paths = natsorted(glob(os.path.join(path, "labels", "*")))
     ds_kwargs, loader_kwargs = util.split_kwargs(
         torch_em.default_segmentation_dataset, **kwargs
     )
