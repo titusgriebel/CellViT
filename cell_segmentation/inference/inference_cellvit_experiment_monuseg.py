@@ -12,6 +12,7 @@ import os
 import sys
 from dataloader_util import get_loader
 import tifffile as tiff
+
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
@@ -37,7 +38,6 @@ from einops import rearrange
 from matplotlib import pyplot as plt
 from PIL import Image, ImageDraw
 from skimage.color import rgba2rgb
-from torch.utils.data import DataLoader
 from torchmetrics.functional import dice
 from torchmetrics.functional.classification import binary_jaccard_index
 from torchvision import transforms
@@ -97,29 +97,27 @@ class MoNuSegInference:
         self.model_path = Path(model_path)
         self.device = f"cuda:{gpu}"
         self.outdir = Path(outdir)
-        self.prediction_dir = os.path.join(outdir, 'predictions')
-        self.label_dir = os.path.join(outdir, 'labels')
-        self.raw_dir = os.path.join(outdir, 'images')
+        self.prediction_dir = os.path.join(outdir, "predictions")
+        self.label_dir = os.path.join(outdir, "labels")
+        self.raw_dir = os.path.join(outdir, "images")
         self.outdir.mkdir(exist_ok=True, parents=True)
         self.magnification = magnification
         self.overlap = overlap
         self.patching = patching
         if overlap > 0:
             assert patching, "Patching must be activated"
-        self.__instantiate_logger() 
+        self.__instantiate_logger()
         self.__load_model()
         self.__load_inference_transforms()
         self.__setup_amp()
         raw_transform = sam_training.identity
-        sampler = MinInstanceSampler(min_num_instances=3)
         self.inference_dataloader = get_loader(
             path=data_path,
             dataset_name=dataset_name,
             patch_shape=(512, 512),
             batch_size=1,
             raw_transform=raw_transform,
-            sampler=sampler
-            )
+        )
         os.makedirs(self.prediction_dir, exist_ok=True)
         os.makedirs(self.label_dir, exist_ok=True)
         os.makedirs(self.raw_dir, exist_ok=True)
@@ -268,7 +266,10 @@ class MoNuSegInference:
         with torch.no_grad():
             for image_idx, batch in inference_loop:
                 image_metrics = self.inference_step(
-                    model=self.model, batch=batch, generate_plots=generate_plots, image_index=f'{(image_idx+1):04}'
+                    model=self.model,
+                    batch=batch,
+                    generate_plots=generate_plots,
+                    image_index=f"{(image_idx+1):04}",
                 )
                 image_names.append(image_metrics["image_name"])
                 binary_dice_scores.append(image_metrics["binary_dice_score"])
@@ -330,7 +331,7 @@ class MoNuSegInference:
         binary_map_ = torch.squeeze(binary_map)
         mask = {
             "instance_map": torch.unsqueeze(torch.squeeze(instance_map), dim=0),
-            "nuclei_binary_map": torch.unsqueeze(binary_map_, dim=0)
+            "nuclei_binary_map": torch.unsqueeze(binary_map_, dim=0),
         }
         mask["instance_types"] = calculate_instances(
             torch.unsqueeze(mask["nuclei_binary_map"], dim=0), mask["instance_map"]
@@ -393,7 +394,7 @@ class MoNuSegInference:
                         x_global = i * 256 - i * self.overlap
                         y_global = j * 256 - j * self.overlap
                         total_img[
-                            :, x_global: x_global + 256, y_global: y_global + 256
+                            :, x_global : x_global + 256, y_global : y_global + 256
                         ] = img[i * decomposed_patch_num + j]
                 img = total_img
                 img = img[None, :, :, :]
@@ -460,7 +461,7 @@ class MoNuSegInference:
             .detach()
             .cpu()
         )
-        remapped_instance_pred = (remap_label(predictions["instance_map"]))
+        remapped_instance_pred = remap_label(predictions["instance_map"])
         prediction_mask = np.squeeze(remapped_instance_pred)
         if prediction_mask.dtype != np.int32:
             prediction_mask = prediction_mask.cpu().numpy().astype(np.uint16)
@@ -689,7 +690,9 @@ class MoNuSegInference:
                         cell_dict["edge_information"] = {}
                         cell_dict["edge_information"]["position"] = position
                         cell_dict["edge_information"]["edge_patches"] = get_edge_patch(
-                            position, i, j  # row, col
+                            position,
+                            i,
+                            j,  # row, col
                         )
                     else:
                         cell_dict["edge_position"] = False
@@ -1021,10 +1024,7 @@ class InferenceCellViTMoNuSegParser:
             default="/projects/datashare/tio/histopathology/public-datasets/MoNuSeg/1024/testing",
         )
         parser.add_argument(
-            "--data",
-            type=str,
-            help="Path where datasets are stored",
-            required=True
+            "--data", type=str, help="Path where datasets are stored", required=True
         )
         parser.add_argument(
             "--outdir",
@@ -1046,13 +1046,13 @@ class InferenceCellViTMoNuSegParser:
             "--patching",
             type=bool,
             help="Patch to 256px images. Default: False",
-            default=False, # set patching to False as default, like the documentation suggests
+            default=False,  # set patching to False as default, like the documentation suggests
         )
         parser.add_argument(
             "--overlap",
             type=int,
             help="Patch overlap, just valid for patching",
-            default=0 # set overlap to default 0, as documented by the authors
+            default=0,  # set overlap to default 0, as documented by the authors
         )
         parser.add_argument(
             "--plots",
