@@ -109,12 +109,25 @@ class MoNuSegInference:
         self.__load_model()
         self.__load_inference_transforms()
         self.__setup_amp()
-        raw_transform = sam_training.identity
+        def custom_transform(x, y):
+            return x, y
+
+        def histopathology_identity(x):
+            """Identity transform.
+            Inspired from 'micro_sam/training/util.py' -> 'identity' function.
+
+            This ensures to skip data normalization when finetuning SAM.
+            Data normalization is performed within the model to SA-1B data statistics
+            and should thus be skipped as a preprocessing step in training.
+            """
+
+            return x
         self.inference_dataloader = get_loader(
             path=data_path,
             patch_shape=(512, 512),
             batch_size=1,
-            raw_transform=raw_transform,
+            transform=custom_transform,
+            raw_transform=histopathology_identity,
         )
         os.makedirs(self.prediction_dir, exist_ok=True)
         os.makedirs(self.label_dir, exist_ok=True)
@@ -342,8 +355,8 @@ class MoNuSegInference:
         if instance_mask.dtype != np.uint16:
             instance_mask = instance_mask.astype(np.uint16)
 
-        tiff.imwrite(image_path, save_image)
-        tiff.imwrite(label_path, instance_mask)
+        # tiff.imwrite(image_path, save_image)
+        # tiff.imwrite(label_path, instance_mask)
         model.zero_grad()
 
         if self.mixed_precision:

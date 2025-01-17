@@ -4,6 +4,19 @@ from natsort import natsorted
 from torch_em.data.datasets import util
 import torch_em
 
+def custom_transform(x, y):
+    return x, y
+
+def histopathology_identity(x):
+    """Identity transform.
+    Inspired from 'micro_sam/training/util.py' -> 'identity' function.
+
+    This ensures to skip data normalization when finetuning SAM.
+    Data normalization is performed within the model to SA-1B data statistics
+    and should thus be skipped as a preprocessing step in training.
+    """
+
+    return x
 
 def get_loader(path, patch_shape, batch_size, **kwargs):
     image_paths = natsorted(glob(os.path.join(path, "images", "*")))
