@@ -1,0 +1,18 @@
+/mnt/lustre-grete/usr/u12649/conda/envs/cellvit/lib/python3.9/site-packages/torchvision/io/image.py:13: UserWarning: Failed to load image Python extension: '/mnt/lustre-grete/usr/u12649/conda/envs/cellvit/lib/python3.9/site-packages/torchvision/image.so: undefined symbol: _ZN3c1017RegisterOperatorsD1Ev'If you don't plan on using image functionality from `torchvision.io`, you can ignore this warning. Otherwise, there might be something wrong with your environment. Did you have `libjpeg` or `libpng` installed before building `torchvision` from source?
+  warn(
+/mnt/lustre-grete/usr/u12649/conda/envs/cellvit/lib/python3.9/site-packages/kornia/feature/lightglue.py:44: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+{'model': '/mnt/lustre-grete/usr/u12649/models/cellvit/checkpoints/CellViT-SAM-H-x40.pth', 'dataset': '/mnt/lustre-grete/usr/u12649/data/final_test/pannuke/loaded_testset', 'outdir': '/mnt/lustre-grete/usr/u12649/models/cellvit_types/inference/pannuke/SAM-H-x40', 'gpu': 0, 'magnification': 40}
+Loading model: /mnt/lustre-grete/usr/u12649/models/cellvit/checkpoints/CellViT-SAM-H-x40.pth
+<All keys matched successfully>
+Loading best model from /mnt/lustre-grete/usr/u12649/models/cellvit/checkpoints/CellViT-SAM-H-x40.pth
+<All keys matched successfully>
+  0%|          | 0/646 [00:00<?, ?it/s]  0%|          | 0/646 [00:00<?, ?it/s]
+Traceback (most recent call last):
+  File "/user/titus.griebel/u12649/CellViT/cell_segmentation/inference/inference_cellvit_experiment_pannuke.py", line 473, in <module>
+    inf.run_patch_inference(model, dataloader, generate_plots=False)
+  File "/user/titus.griebel/u12649/CellViT/cell_segmentation/inference/inference_cellvit_experiment_pannuke.py", line 319, in run_patch_inference
+    model, batch, generate_plots=generate_plots, image_name=image_idx[self.image_names]
+TypeError: 'int' object is not subscriptable
+Running inference with CellViT SAM-H-x40 model on pannuke dataset...
+Successfully ran inference with CellViT SAM-H-x40 model on pannuke dataset
