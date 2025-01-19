@@ -12,7 +12,8 @@ import os
 import sys
 from dataloader_util import get_loader
 import tifffile as tiff
-
+from natsort import natsorted
+from glob import glob
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
@@ -100,6 +101,7 @@ class MoNuSegInference:
         self.magnification = magnification
         self.overlap = overlap
         self.patching = patching
+        self.image_names = [os.path.basename(img) for img in natsorted(glob(os.path.join(data_path, "test_images", "*.tiff")))]
         if overlap > 0:
             assert patching, "Patching must be activated"
         self.__instantiate_logger()
@@ -274,7 +276,7 @@ class MoNuSegInference:
                     model=self.model,
                     batch=batch,
                     generate_plots=generate_plots,
-                    image_index=f"{(image_idx+1):04}",
+                    image_name=self.image_names[image_idx],
                 )
                 image_names.append(image_metrics["image_name"])
                 binary_dice_scores.append(image_metrics["binary_dice_score"])
@@ -310,7 +312,7 @@ class MoNuSegInference:
         [self.logger.info(f"{f'{k}:': <25} {v}") for k, v in dataset_metrics.items()]
 
     def inference_step(
-        self, model: nn.Module, batch: object, image_index, generate_plots: bool = False
+        self, model: nn.Module, batch: object, image_name, generate_plots: bool = False
     ) -> dict:
         """Inference step
 
@@ -331,7 +333,6 @@ class MoNuSegInference:
         if torch.max(img) >= 5:
             img = img / 255
         instance_map = batch[1]
-        image_name = f"{image_index}.tiff"
         binary_map = (instance_map > 0).int()
         binary_map_ = torch.squeeze(binary_map)
         mask = {
