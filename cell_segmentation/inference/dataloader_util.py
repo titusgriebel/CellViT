@@ -8,6 +8,18 @@ def custom_transform(x, y):
     return x, y
 
 
+def histopathology_identity(x):
+    """Identity transform.
+    Inspired from 'micro_sam/training/util.py' -> 'identity' function.
+
+    This ensures to skip data normalization when finetuning SAM.
+    Data normalization is performed within the model to SA-1B data statistics
+    and should thus be skipped as a preprocessing step in training.
+    """
+
+    return x
+
+
 def get_loader(path, patch_shape, batch_size, **kwargs):
     image_paths = natsorted(glob(os.path.join(path, "eval_split", "test_images", "*.tiff")))
     label_paths = natsorted(glob(os.path.join(path, "eval_split", "test_labels", "*.tiff")))
@@ -22,6 +34,7 @@ def get_loader(path, patch_shape, batch_size, **kwargs):
         patch_shape=patch_shape,
         is_seg_dataset=False,
         transform=custom_transform,
+        raw_transform=histopathology_identity,
         **ds_kwargs,
     )
     return torch_em.get_data_loader(dataset, batch_size, **loader_kwargs)

@@ -265,7 +265,6 @@ class InferenceCellViT:
         else:
             mean = (0.5, 0.5, 0.5)
             std = (0.5, 0.5, 0.5)
-        raw_transform = sam_training.identity
         inference_dataloader = get_loader(
             path=self.input_dir,
             patch_shape=(512, 512),
@@ -273,7 +272,6 @@ class InferenceCellViT:
             num_workers=8,
             pin_memory=False,
             shuffle=False,
-            raw_transform=raw_transform,
         )
 
         return model, inference_dataloader
@@ -316,7 +314,7 @@ class InferenceCellViT:
         with torch.no_grad():
             for image_idx, batch in inference_loop:
                 self.inference_step(
-                    model, batch, generate_plots=generate_plots, image_name=image_idx[self.image_names]
+                    model, batch, generate_plots=generate_plots, image_name=self.image_names[image_idx]
                 )
                
 
@@ -364,8 +362,9 @@ class InferenceCellViT:
         prediction = self.unpack_predictions(predictions=predictions, model=model)
         prediction_mask = prediction.cpu().numpy().astype(np.uint16)
         pred_mask = np.squeeze(prediction_mask)
-        semantic_labels = np.argmax(pred_mask, axis=0).astype(np.uint8) 
+        semantic_labels = np.argmax(pred_mask, axis=0)
         output_path = os.path.join(str(self.output_dir), image_name)
+        print("saving image to: ", output_path)
         imageio.imwrite(output_path, semantic_labels)
 
 
