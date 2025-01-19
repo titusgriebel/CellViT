@@ -96,9 +96,6 @@ class MoNuSegInference:
         self.model_path = Path(model_path)
         self.device = f"cuda:{gpu}"
         self.outdir = Path(outdir)
-        self.prediction_dir = os.path.join(outdir, "predictions")
-        self.label_dir = os.path.join(outdir, "labels")
-        self.raw_dir = os.path.join(outdir, "images")
         self.outdir.mkdir(exist_ok=True, parents=True)
         self.magnification = magnification
         self.overlap = overlap
@@ -129,9 +126,6 @@ class MoNuSegInference:
             transform=custom_transform,
             raw_transform=histopathology_identity,
         )
-        os.makedirs(self.prediction_dir, exist_ok=True)
-        os.makedirs(self.label_dir, exist_ok=True)
-        os.makedirs(self.raw_dir, exist_ok=True)
 
     def __instantiate_logger(self) -> None:
         """Instantiate logger
@@ -347,16 +341,6 @@ class MoNuSegInference:
         mask["instance_types"] = calculate_instances(
             torch.unsqueeze(mask["nuclei_binary_map"], dim=0), mask["instance_map"]
         )
-        image_path = os.path.join(self.raw_dir, image_name)
-        label_path = os.path.join(self.label_dir, image_name)
-        instance_mask = np.squeeze(mask["instance_map"].cpu().numpy())
-        raw_image = np.squeeze(img.cpu().numpy())
-        save_image = raw_image.transpose(1, 2, 0)
-        if instance_mask.dtype != np.uint16:
-            instance_mask = instance_mask.astype(np.uint16)
-
-        # tiff.imwrite(image_path, save_image)
-        # tiff.imwrite(label_path, instance_mask)
         model.zero_grad()
 
         if self.mixed_precision:
@@ -381,42 +365,6 @@ class MoNuSegInference:
                 cell_list=cell_list, gt=mask, image_name=image_name
             )
 
-        scores = [
-            float(image_metrics["binary_dice_score"].detach().cpu()),
-            float(image_metrics["binary_jaccard_score"].detach().cpu()),
-            image_metrics["pq_score"],
-        ]
-        if generate_plots:
-            if self.overlap == 0 and self.patching:
-                batch_size = img.shape[0]
-                num_elems = int(np.sqrt(batch_size))
-                img = torch.permute(img, (0, 2, 3, 1))
-                img = rearrange(
-                    img, "(i j) h w c -> (i h) (j w) c", i=num_elems, j=num_elems
-                )
-                img = torch.unsqueeze(img, dim=0)
-                img = torch.permute(img, (0, 3, 1, 2))
-            elif self.overlap != 0 and self.patching:
-                h, w = mask["nuclei_binary_map"].shape[1:]
-                total_img = torch.zeros((3, h, w))
-                decomposed_patch_num = int(np.sqrt(img.shape[0]))
-                for i in range(decomposed_patch_num):
-                    for j in range(decomposed_patch_num):
-                        x_global = i * 256 - i * self.overlap
-                        y_global = j * 256 - j * self.overlap
-                        total_img[
-                            :, x_global : x_global + 256, y_global : y_global + 256
-                        ] = img[i * decomposed_patch_num + j]
-                img = total_img
-                img = img[None, :, :, :]
-            self.plot_results(
-                img=img,
-                predictions=predictions,
-                ground_truth=mask,
-                img_name=image_name,
-                outdir=self.outdir,
-                scores=scores,
-            )
 
         return image_metrics
 
@@ -476,7 +424,7 @@ class MoNuSegInference:
         prediction_mask = np.squeeze(remapped_instance_pred)
         if prediction_mask.dtype != np.int32:
             prediction_mask = prediction_mask.cpu().numpy().astype(np.uint16)
-        output_path = os.path.join(self.prediction_dir, image_name)
+        output_path = os.path.join(self.outdir, image_name)
 
         tiff.imwrite(output_path, prediction_mask)
         remapped_gt = remap_label(instance_maps_gt)

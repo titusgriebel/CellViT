@@ -19,8 +19,8 @@ def histopathology_identity(x):
     return x
 
 def get_loader(path, patch_shape, batch_size, **kwargs):
-    image_paths = natsorted(glob(os.path.join(path, "images", "*")))
-    label_paths = natsorted(glob(os.path.join(path, "labels", "*")))
+    image_paths = natsorted(glob(os.path.join(path, "test_images", "*.tiff")))
+    label_paths = natsorted(glob(os.path.join(path, "test_labels", "*.tiff")))
     ds_kwargs, loader_kwargs = util.split_kwargs(
         torch_em.default_segmentation_dataset, **kwargs
     )
