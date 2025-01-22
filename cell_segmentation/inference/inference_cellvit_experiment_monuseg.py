@@ -108,19 +108,15 @@ class MoNuSegInference:
         self.__load_model()
         self.__load_inference_transforms()
         self.__setup_amp()
+        
         def custom_transform(x, y):
             return x, y
 
-        def histopathology_identity(x):
-            """Identity transform.
-            Inspired from 'micro_sam/training/util.py' -> 'identity' function.
+        def histopathology_identity(raw):
+            from torch_em.transform.raw import standardize
+            raw = standardize(raw, mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+            return raw
 
-            This ensures to skip data normalization when finetuning SAM.
-            Data normalization is performed within the model to SA-1B data statistics
-            and should thus be skipped as a preprocessing step in training.
-            """
-
-            return x
         self.inference_dataloader = get_loader(
             path=data_path,
             patch_shape=(512, 512),
