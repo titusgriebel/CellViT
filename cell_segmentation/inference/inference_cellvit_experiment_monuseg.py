@@ -108,14 +108,25 @@ class MoNuSegInference:
         self.__load_model()
         self.__load_inference_transforms()
         self.__setup_amp()
-        
+
         def custom_transform(x, y):
             return x, y
 
-        def histopathology_identity(raw):
-            from torch_em.transform.raw import standardize
-            raw = standardize(raw, mean=0.5, std=0.5, axis=(1, 2))
-            return raw
+        # def transform_alb(self, raw_image):  # this caused worse results compared to no transforms
+        #     transformed = self.inference_transforms(image=raw_image)
+        #     transformed_image = transformed['image']
+        #     return transformed_image
+
+        def histopathology_identity(x):
+            """Identity transform.
+            Inspired from 'micro_sam/training/util.py' -> 'identity' function.
+
+            This ensures to skip data normalization when finetuning SAM.
+            Data normalization is performed within the model to SA-1B data statistics
+            and should thus be skipped as a preprocessing step in training.
+            """
+
+            return x
 
         self.inference_dataloader = get_loader(
             path=data_path,
@@ -124,6 +135,19 @@ class MoNuSegInference:
             transform=custom_transform,
             raw_transform=histopathology_identity,
         )
+
+    def __load_inference_transforms(self) -> None:
+        """Load the inference transformations from the run_configuration"""
+        self.logger.info("Loading inference transformations")
+
+        transform_settings = self.run_conf["transformations"]
+        if "normalize" in transform_settings:
+            mean = transform_settings["normalize"].get("mean", (0.5, 0.5, 0.5))
+            std = transform_settings["normalize"].get("std", (0.5, 0.5, 0.5))
+        else:
+            mean = (0.5, 0.5, 0.5)
+            std = (0.5, 0.5, 0.5)
+        self.inference_transforms = A.Compose([A.Normalize(mean=mean, std=std)])
 
     def __instantiate_logger(self) -> None:
         """Instantiate logger
@@ -226,18 +250,7 @@ class MoNuSegInference:
             )
         return model
 
-    def __load_inference_transforms(self) -> None:
-        """Load the inference transformations from the run_configuration"""
-        self.logger.info("Loading inference transformations")
-
-        transform_settings = self.run_conf["transformations"]
-        if "normalize" in transform_settings:
-            mean = transform_settings["normalize"].get("mean", (0.5, 0.5, 0.5))
-            std = transform_settings["normalize"].get("std", (0.5, 0.5, 0.5))
-        else:
-            mean = (0.5, 0.5, 0.5)
-            std = (0.5, 0.5, 0.5)
-        self.inference_transforms = A.Compose([A.Normalize(mean=mean, std=std)])
+    
 
     def __setup_amp(self) -> None:
         """Setup automated mixed precision (amp) for inference."""
@@ -326,7 +339,7 @@ class MoNuSegInference:
             img = img[0]
             img = rearrange(img, "c i j w h -> (i j) c w h")
         img = img.to(torch.float32)
-        if torch.max(img) >= 5:
+        if torch.max(img) >= 5: # this stems from the monuseg.py script which we do not use
             img = img / 255
         instance_map = batch[1]
         binary_map = (instance_map > 0).int()
