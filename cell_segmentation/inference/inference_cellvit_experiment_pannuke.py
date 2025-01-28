@@ -260,7 +260,22 @@ class InferenceCellViT:
         )
         self.logger.info(model.load_state_dict(checkpoint["model_state_dict"]))
 
-        
+        def custom_transform(x, y):
+            return x, y
+
+  
+        def histopathology_identity(x):
+            """Identity transform.
+            Inspired from 'micro_sam/training/util.py' -> 'identity' function.
+
+            This ensures to skip data normalization when finetuning SAM.
+            Data normalization is performed within the model to SA-1B data statistics
+            and should thus be skipped as a preprocessing step in training.
+            """
+
+            return x
+
+       
 
         transform_settings = self.run_conf["transformations"]
         if "normalize" in transform_settings:
@@ -271,11 +286,11 @@ class InferenceCellViT:
             std = (0.5, 0.5, 0.5)
         inference_dataloader = get_loader(
             path=self.input_dir,
-            patch_shape=(512, 512),
+            patch_shape=(256, 256),
             batch_size=1,
-            num_workers=8,
-            pin_memory=False,
             shuffle=False,
+            transform=custom_transform,
+            raw_transform=histopathology_identity,
         )
 
         return model, inference_dataloader
