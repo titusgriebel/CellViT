@@ -4,16 +4,14 @@
 # @ Fabian Hörst, fabian.hoerst@uk-essen.de
 # Institute for Artifical Intelligence in Medicine,
 # University Medicine Essen
-from torch_em.data import MinInstanceSampler
-import micro_sam.training as sam_training
 import argparse
 import inspect
 import os
 import sys
-from dataloader_util import get_loader
 import tifffile as tiff
 from natsort import natsorted
 from glob import glob
+import imageio.v3 as imageio
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
@@ -81,6 +79,7 @@ class MoNuSegInference:
         patching: bool = False,
         overlap: int = 0,
         magnification: int = 40,
+        stitched: bool = False,
     ) -> None:
         """Cell Segmentation Inference class for MoNuSeg dataset
 
@@ -95,13 +94,15 @@ class MoNuSegInference:
             magnification (int, optional): Dataset magnification. Defaults to 40.
         """
         self.model_path = Path(model_path)
+        self.stitched = stitched
         self.device = f"cuda:{gpu}"
         self.outdir = Path(outdir)
         self.outdir.mkdir(exist_ok=True, parents=True)
         self.magnification = magnification
         self.overlap = overlap
         self.patching = patching
-        self.image_names = [os.path.basename(img) for img in natsorted(glob(os.path.join(data_path, "test_images", "*.tiff")))]
+        self.image_files = natsorted(glob(os.path.join(data_path, "test_images", "*")))
+        self.label_files = natsorted(glob(os.path.join(data_path, "test_labels", "*")))
         if overlap > 0:
             assert patching, "Patching must be activated"
         self.__instantiate_logger()
@@ -109,32 +110,32 @@ class MoNuSegInference:
         self.__load_inference_transforms()
         self.__setup_amp()
 
-        def custom_transform(x, y):
-            return x, y
+        # def custom_transform(x, y):
+        #     return x, y
 
-        # def transform_alb(self, raw_image):  # this caused worse results compared to no transforms
-        #     transformed = self.inference_transforms(image=raw_image)
-        #     transformed_image = transformed['image']
-        #     return transformed_image
+        # # def transform_alb(self, raw_image):  # this caused worse results compared to no transforms
+        # #     transformed = self.inference_transforms(image=raw_image)
+        # #     transformed_image = transformed['image']
+        # #     return transformed_image
 
-        def histopathology_identity(x):
-            """Identity transform.
-            Inspired from 'micro_sam/training/util.py' -> 'identity' function.
+        # def histopathology_identity(x):
+        #     """Identity transform.
+        #     Inspired from 'micro_sam/training/util.py' -> 'identity' function.
 
-            This ensures to skip data normalization when finetuning SAM.
-            Data normalization is performed within the model to SA-1B data statistics
-            and should thus be skipped as a preprocessing step in training.
-            """
+        #     This ensures to skip data normalization when finetuning SAM.
+        #     Data normalization is performed within the model to SA-1B data statistics
+        #     and should thus be skipped as a preprocessing step in training.
+        #     """
 
-            return x
+        #     return x
 
-        self.inference_dataloader = get_loader(
-            path=data_path,
-            patch_shape=(512, 512),
-            batch_size=1,
-            transform=custom_transform,
-            raw_transform=histopathology_identity,
-        )
+        # self.inference_dataloader = get_loader(
+        #     path=data_path,
+        #     patch_shape=(512, 512),
+        #     batch_size=1,
+        #     transform=custom_transform,
+        #     raw_transform=histopathology_identity,
+        # )
 
     def __load_inference_transforms(self) -> None:
         """Load the inference transformations from the run_configuration"""
@@ -250,8 +251,6 @@ class MoNuSegInference:
             )
         return model
 
-    
-
     def __setup_amp(self) -> None:
         """Setup automated mixed precision (amp) for inference."""
         self.mixed_precision = self.run_conf["training"].get("mixed_precision", False)
@@ -275,27 +274,24 @@ class MoNuSegInference:
         prec_ds = []  # precision per image
         rec_ds = []  # recall per image
 
-        inference_loop = tqdm.tqdm(
-            enumerate(self.inference_dataloader), total=len(self.inference_dataloader)
-        )
-
         with torch.no_grad():
-            for image_idx, batch in inference_loop:
+            for image_path, label_path in tqdm.tqdm(zip(self.image_files, self.label_files), desc="Predicting..."):
                 image_metrics = self.inference_step(
                     model=self.model,
-                    batch=batch,
+                    image_path=image_path,
+                    label_path=label_path,
                     generate_plots=generate_plots,
-                    image_name=self.image_names[image_idx],
                 )
-                image_names.append(image_metrics["image_name"])
-                binary_dice_scores.append(image_metrics["binary_dice_score"])
-                binary_jaccard_scores.append(image_metrics["binary_jaccard_score"])
-                pq_scores.append(image_metrics["pq_score"])
-                dq_scores.append(image_metrics["dq_score"])
-                sq_scores.append(image_metrics["sq_score"])
-                f1_ds.append(image_metrics["f1_d"])
-                prec_ds.append(image_metrics["prec_d"])
-                rec_ds.append(image_metrics["rec_d"])
+                if image_metrics is not None:
+                    image_names.append(image_metrics["image_name"])
+                    binary_dice_scores.append(image_metrics["binary_dice_score"])
+                    binary_jaccard_scores.append(image_metrics["binary_jaccard_score"])
+                    pq_scores.append(image_metrics["pq_score"])
+                    dq_scores.append(image_metrics["dq_score"])
+                    sq_scores.append(image_metrics["sq_score"])
+                    f1_ds.append(image_metrics["f1_d"])
+                    prec_ds.append(image_metrics["prec_d"])
+                    rec_ds.append(image_metrics["rec_d"])
 
         # average metrics for dataset
         binary_dice_scores = np.array(binary_dice_scores)
@@ -321,7 +317,7 @@ class MoNuSegInference:
         [self.logger.info(f"{f'{k}:': <25} {v}") for k, v in dataset_metrics.items()]
 
     def inference_step(
-        self, model: nn.Module, batch: object, image_name, generate_plots: bool = False
+        self, model: nn.Module, image_path, label_path, generate_plots: bool = False
     ) -> dict:
         """Inference step
 
@@ -334,48 +330,98 @@ class MoNuSegInference:
             Dict: Image_metrics with keys:
 
         """
-        img = batch[0].to(self.device)
-        if len(img.shape) > 4:
-            img = img[0]
-            img = rearrange(img, "c i j w h -> (i j) c w h")
-        img = img.to(torch.float32)
-        if torch.max(img) >= 5: # this stems from the monuseg.py script which we do not use
-            img = img / 255
-        instance_map = batch[1]
-        binary_map = (instance_map > 0).int()
-        binary_map_ = torch.squeeze(binary_map)
-        mask = {
-            "instance_map": torch.unsqueeze(torch.squeeze(instance_map), dim=0),
-            "nuclei_binary_map": torch.unsqueeze(binary_map_, dim=0),
-        }
-        mask["instance_types"] = calculate_instances(
-            torch.unsqueeze(mask["nuclei_binary_map"], dim=0), mask["instance_map"]
-        )
-        model.zero_grad()
+        def segmentation_function(image, block_id=None, return_image_metrics=False):
+            'This function does inference for CellViT per image.'
+            image = image.transpose(2, 0, 1)
+            print(image.shape)
+            img_tensor = torch.from_numpy(image)[None].to(self.device)
+            # Get the labels
+            image_name = os.path.basename(image_path)
+            label = imageio.imread(label_path)
+            label_tensor = torch.from_numpy(label.astype("int64"))
+            label_tensor = label_tensor.unsqueeze(0)
+            label = label_tensor.to(self.device)
 
-        if self.mixed_precision:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                predictions_ = model.forward(img)
+            instance_map = label
+            binary_map = (instance_map > 0).int()
+            binary_map_ = torch.squeeze(binary_map)
+            mask = {
+                "instance_map": torch.unsqueeze(torch.squeeze(instance_map), dim=0),
+                "nuclei_binary_map": torch.unsqueeze(binary_map_, dim=0),
+            }
+            mask["instance_types"] = calculate_instances(
+                torch.unsqueeze(mask["nuclei_binary_map"], dim=0), mask["instance_map"]
+            )
+
+            # Run inference with the input tensors.
+            if len(img_tensor.shape) > 4:
+                img_tensor = img_tensor[0]
+                img_tensor = rearrange(img_tensor, "c i j w h -> (i j) c w h")
+
+            img_tensor = img_tensor.to(torch.float32)
+            img_tensor = img_tensor / 255
+
+            model.zero_grad()
+            if self.mixed_precision:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    predictions_ = model.forward(img_tensor)
+            else:
+                predictions_ = model.forward(img_tensor)
+
+            # Do some other post-processing stuff
+            if self.overlap == 0:
+                if self.patching:
+                    predictions_ = self.post_process_patching(predictions_)
+                predictions = self.get_cell_predictions(predictions_)
+                # image_metrics = self.calculate_step_metric(
+                #     predictions=predictions, gt=mask, image_name=image_name
+                # )
+
+            elif self.patching and self.overlap != 0:
+                cell_list = self.post_process_patching_overlap(
+                    predictions_, overlap=self.overlap
+                )
+                image_metrics, predictions = self.calculate_step_metric_overlap(
+                    cell_list=cell_list, gt=mask, image_name=image_name
+                )
+            image_metrics = None
+            # Get the instance segmentation outputs.
+            instance_segmentation = remap_label(predictions["instance_map"])
+            if instance_segmentation.dtype != np.int32:
+                instance_segmentation = instance_segmentation.cpu().numpy().astype(np.int32)
+            instance_segmentation = np.squeeze(instance_segmentation)
+            print("Prediction shape: ", instance_segmentation.shape)
+            if return_image_metrics:
+                return instance_segmentation, image_metrics
+            else:
+                return instance_segmentation
+
+        image = imageio.imread(image_path)
+        print(image.shape)
+        if image.shape[0] > 1024:
+            do_tiling_based_prediction = True
         else:
-            predictions_ = model.forward(img)
+            do_tiling_based_prediction = False
 
-        if self.overlap == 0:
-            if self.patching:
-                predictions_ = self.post_process_patching(predictions_)
-            predictions = self.get_cell_predictions(predictions_)
-            image_metrics = self.calculate_step_metric(
-                predictions=predictions, gt=mask, image_name=image_name
+        if do_tiling_based_prediction:
+            # This function does tiling window based prediction and stitches the per tile seg. together. 
+            from elf.segmentation.stitching import stitch_segmentation
+            instance_segmentation = stitch_segmentation(
+                input_=image,
+                segmentation_function=segmentation_function,
+                tile_shape=(896, 896),
+                tile_overlap=(64, 64),
+                shape=image.shape[:-1],
             )
+            image_metrics = None
+        else:
+            instance_segmentation, image_metrics = segmentation_function(image, return_image_metrics=True)
 
-        elif self.patching and self.overlap != 0:
-            cell_list = self.post_process_patching_overlap(
-                predictions_, overlap=self.overlap
-            )
-            image_metrics, predictions = self.calculate_step_metric_overlap(
-                cell_list=cell_list, gt=mask, image_name=image_name
-            )
+        #  Store instance segmentation always via here.
+        image_name = os.path.basename(image_path)
+        output_path = os.path.join(self.outdir, image_name)
 
-
+        imageio.imwrite(output_path, instance_segmentation)
         return image_metrics
 
     def calculate_step_metric(
@@ -433,10 +479,8 @@ class MoNuSegInference:
         remapped_instance_pred = remap_label(predictions["instance_map"])
         prediction_mask = np.squeeze(remapped_instance_pred)
         if prediction_mask.dtype != np.int32:
-            prediction_mask = prediction_mask.cpu().numpy().astype(np.uint16)
-        output_path = os.path.join(self.outdir, image_name)
-
-        tiff.imwrite(output_path, prediction_mask)
+            prediction_mask = prediction_mask.cpu().numpy().astype(np.int32)
+     
         remapped_gt = remap_label(instance_maps_gt)
         [dq, sq, pq], _ = get_fast_pq(true=remapped_gt, pred=remapped_instance_pred)
 
@@ -628,8 +672,8 @@ class MoNuSegInference:
 
         for i in range(decomposed_patch_num):
             for j in range(decomposed_patch_num):
-                x_global = i * 256 - i * overlap
-                y_global = j * 256 - j * overlap
+                x_global = i * 1024 - i * overlap
+                y_global = j * 1024 - j * overlap
                 patch_instance_types = predictions["instance_types"][
                     i * decomposed_patch_num + j
                 ]
@@ -650,11 +694,11 @@ class MoNuSegInference:
                             i,  # row
                             j,  # col
                         ],
-                        "cell_status": get_cell_position_marging(cell["bbox"], 256, 64),
+                        "cell_status": get_cell_position_marging(cell["bbox"], 1024, 64),
                         "offset_global": offset_global.tolist(),
                     }
-                    if np.max(cell["bbox"]) == 256 or np.min(cell["bbox"]) == 0:
-                        position = get_cell_position(cell["bbox"], 256)
+                    if np.max(cell["bbox"]) == 1024 or np.min(cell["bbox"]) == 0:
+                        position = get_cell_position(cell["bbox"], 1024)
                         cell_dict["edge_position"] = True
                         cell_dict["edge_information"] = {}
                         cell_dict["edge_information"]["position"] = position
@@ -1024,6 +1068,10 @@ class InferenceCellViTMoNuSegParser:
             help="Generate result plots. Default: False",
             default=True,
         )
+        parser.add_argument(
+            "--stitched",
+            action="store_true",
+        )
 
         self.parser = parser
 
@@ -1045,5 +1093,6 @@ if __name__ == "__main__":
         patching=configuration["patching"],
         magnification=configuration["magnification"],
         overlap=configuration["overlap"],
+        stitched=configuration["stitched"],
     )
     inf.run_inference(generate_plots=configuration["plots"])

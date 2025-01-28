@@ -92,7 +92,7 @@ class InferenceCellViT:
         self.output_dir = Path(output_dir)
         self.run_dir = Path(os.path.join(output_dir, "logs"))
         self.inst_outdir = os.path.join(output_dir, "instance")
-        self.class_outdir = os.path.join(output_dir, "semantic")
+        self.class_outdir = os.path.join(output_dir)
         os.makedirs(self.inst_outdir, exist_ok=True)
         os.makedirs(self.class_outdir, exist_ok=True)
         os.makedirs(self.run_dir, exist_ok=True)
@@ -100,7 +100,7 @@ class InferenceCellViT:
         self.run_conf: dict = None
         self.logger: Logger = None
         self.magnification = magnification
-        self.image_names = [os.path.basename(img) for img in natsorted(glob(os.path.join(input_dir, "eval_split", "test_images", "*.tiff")))]
+        self.image_names = [os.path.basename(img) for img in natsorted(glob(os.path.join(input_dir, "test_images", "*")))]
 
         # self.__load_run_conf()
 
@@ -365,19 +365,18 @@ class InferenceCellViT:
             predictions = model.forward(img)
         class_pred, inst_pred = self.unpack_predictions(predictions=predictions, model=model)
 
-
         int_class = class_pred.cpu().numpy().astype(np.uint16)
         squeezed_class = np.squeeze(int_class)
         final_class = np.argmax(squeezed_class, axis=0)
         class_output = os.path.join(str(self.class_outdir), image_name)
         imageio.imwrite(class_output, final_class)
-        
-        if inst_pred.dtype != np.int32:
-            inst_pred = inst_pred.cpu().numpy()        
-        int_inst = inst_pred.astype(np.uint16)
-        squeezed_inst = np.squeeze(int_inst)
-        inst_output = os.path.join(str(self.inst_outdir), image_name)
-        imageio.imwrite(inst_output, squeezed_inst)
+
+        # if inst_pred.dtype != np.int32:
+        #     inst_pred = inst_pred.cpu().numpy()        
+        # int_inst = inst_pred.astype(np.uint16)
+        # squeezed_inst = np.squeeze(int_inst)
+        # inst_output = os.path.join(str(self.inst_outdir), image_name)
+        # imageio.imwrite(inst_output, squeezed_inst)
 
 
 
