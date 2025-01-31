@@ -4,14 +4,16 @@
 # @ Fabian Hörst, fabian.hoerst@uk-essen.de
 # Institute for Artifical Intelligence in Medicine,
 # University Medicine Essen
-import argparse
-import inspect
+
 import os
 import sys
-import tifffile as tiff
-from natsort import natsorted
+import inspect
+import argparse
 from glob import glob
+from natsort import natsorted
+
 import imageio.v3 as imageio
+
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
@@ -331,29 +333,26 @@ class MoNuSegInference:
 
         """
         def segmentation_function(image, block_id=None, return_image_metrics=False):
-            'This function does inference for CellViT per image.'
+            "Function that performs inference for CellViT per image."
+            # Get the input image and make it channels first.
+            assert image.ndim == 3, image.shape
             image = image.transpose(2, 0, 1)
-            print(image.shape)
-            img_tensor = torch.from_numpy(image)[None].to(self.device)
-            # Get the labels
-            image_name = os.path.basename(image_path)
-            label = imageio.imread(label_path)
-            label_tensor = torch.from_numpy(label.astype("int64"))
-            label_tensor = label_tensor.unsqueeze(0)
-            label = label_tensor.to(self.device)
 
-            instance_map = label
-            binary_map = (instance_map > 0).int()
-            binary_map_ = torch.squeeze(binary_map)
-            mask = {
-                "instance_map": torch.unsqueeze(torch.squeeze(instance_map), dim=0),
-                "nuclei_binary_map": torch.unsqueeze(binary_map_, dim=0),
-            }
-            mask["instance_types"] = calculate_instances(
-                torch.unsqueeze(mask["nuclei_binary_map"], dim=0), mask["instance_map"]
-            )
+            # HACK: When using tiling-window based predictions,
+            # we ensure square shaped inputs by padding (which we restore to original later).
+            if block_id:
+                # If the image is empty (i.e. a already padded region - made to replicate WSI),
+                # we need not go further with predictions and return empty patches as instances.
+                if np.max(image) == 0:
+                    return np.zeros(image.shape[1:], dtype=np.int32)
+
+                original_shape = image.shape[1:]
+                from torch_em.transform.generic import PadIfNecessary
+                pad_trafo = PadIfNecessary(shape=(3, 1024, 1024), padding_mode="constant")
+                image = pad_trafo(image)
 
             # Run inference with the input tensors.
+            img_tensor = torch.from_numpy(image)[None].to(self.device)
             if len(img_tensor.shape) > 4:
                 img_tensor = img_tensor[0]
                 img_tensor = rearrange(img_tensor, "c i j w h -> (i j) c w h")
@@ -368,7 +367,21 @@ class MoNuSegInference:
             else:
                 predictions_ = model.forward(img_tensor)
 
-            # Do some other post-processing stuff
+            # Get the labels.
+            image_name = os.path.basename(image_path)
+            label = imageio.imread(label_path)
+            instance_map = torch.from_numpy(label.astype("int64"))[None].to(self.device)
+            binary_map = (instance_map > 0).int()
+            binary_map_ = torch.squeeze(binary_map)
+            mask = {
+                "instance_map": torch.unsqueeze(torch.squeeze(instance_map), dim=0),
+                "nuclei_binary_map": torch.unsqueeze(binary_map_, dim=0),
+            }
+            mask["instance_types"] = calculate_instances(
+                torch.unsqueeze(mask["nuclei_binary_map"], dim=0), mask["instance_map"]
+            )
+
+            # Do some other post-processing stuff.
             if self.overlap == 0:
                 if self.patching:
                     predictions_ = self.post_process_patching(predictions_)
@@ -385,26 +398,31 @@ class MoNuSegInference:
                     cell_list=cell_list, gt=mask, image_name=image_name
                 )
             image_metrics = None
+
             # Get the instance segmentation outputs.
-            instance_segmentation = remap_label(predictions["instance_map"])
-            if instance_segmentation.dtype != np.int32:
-                instance_segmentation = instance_segmentation.cpu().numpy().astype(np.int32)
-            instance_segmentation = np.squeeze(instance_segmentation)
-            print("Prediction shape: ", instance_segmentation.shape)
+            instance_segmentation = predictions["instance_map"].squeeze().detach().cpu().numpy()
+
+            # HACK: Convert the padded inputs to original shape.
+            if block_id:
+                instance_segmentation = instance_segmentation[tuple(slice(0, ax) for ax in original_shape)]
+
+            instance_segmentation = remap_label(instance_segmentation).astype(np.int32)
+
             if return_image_metrics:
                 return instance_segmentation, image_metrics
             else:
                 return instance_segmentation
 
         image = imageio.imread(image_path)
-        print(image.shape)
-        if image.shape[0] > 1024:
+
+        # If either of the two axes habe shapes greater than 1024, we perform tiling window-based prediction.
+        if image.shape[0] > 1024 or image.shape[1] > 1024:
             do_tiling_based_prediction = True
         else:
             do_tiling_based_prediction = False
 
         if do_tiling_based_prediction:
-            # This function does tiling window based prediction and stitches the per tile seg. together. 
+            # This function does tiling window based prediction and stitches the per tile seg. together.
             from elf.segmentation.stitching import stitch_segmentation
             instance_segmentation = stitch_segmentation(
                 input_=image,
@@ -416,6 +434,11 @@ class MoNuSegInference:
             image_metrics = None
         else:
             instance_segmentation, image_metrics = segmentation_function(image, return_image_metrics=True)
+
+        if instance_segmentation.shape != image.shape[:-1]:
+            raise ValueError(
+                f"Image shape: '{image.shape}' and instance segmentation shape: '{instance_segmentation}' should match."
+            )
 
         #  Store instance segmentation always via here.
         image_name = os.path.basename(image_path)
@@ -480,7 +503,7 @@ class MoNuSegInference:
         prediction_mask = np.squeeze(remapped_instance_pred)
         if prediction_mask.dtype != np.int32:
             prediction_mask = prediction_mask.cpu().numpy().astype(np.int32)
-     
+
         remapped_gt = remap_label(instance_maps_gt)
         [dq, sq, pq], _ = get_fast_pq(true=remapped_gt, pred=remapped_instance_pred)
 
